@@ -61,7 +61,7 @@ pub struct ServerConfig {
     /// Tighter `tool_call_recovery` (default off): a bare `<function=` only at the start of a line and outside code, a
     /// `<tool_call>` only outside code.
     pub tool_call_recovery_tight: bool,
-    /// Accepted from older configs, no effect: `max_tokens` past the context is always shortened to fit, on or off.
+    /// Shorten a `max_tokens` that exceeds the remaining context instead of rejecting with HTTP 400 (default `false`).
     pub fit_max_tokens: bool,
     pub anthropic_think_unasked: bool,
     pub sampling: SamplingParams,

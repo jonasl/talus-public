@@ -4,7 +4,7 @@
 use crate::config::ServerConfig;
 use crate::engine::{
     Engine, EngineError, EngineTimings, GenerateRequest, SamplingParams, ScriptedMockEngine,
-    StdioSubprocessEngine,
+    StdioSubprocessEngine, CTX_SLACK,
 };
 use crate::frontend::{
     anthropic_to_messages, forced_call, openai_to_messages_with_effort, render_chat_prompt,
@@ -2907,7 +2907,8 @@ fn handle_llama_completion(
     let want_lp = sampling.logprobs.is_some();
     let mut lp_entries: Vec<JsonValue> = Vec::new();
     let ctx = state.reported_ctx();
-    if ids.len() >= ctx {
+    let room = ctx.saturating_sub(CTX_SLACK).saturating_sub(ids.len());
+    if room == 0 {
         return send_post_error(
             stream,
             "/completion",
@@ -2917,16 +2918,35 @@ fn handle_llama_completion(
             Some("context_length_exceeded"),
         );
     }
-    let raw_n = req
-        .get_i64("n_predict")
-        .or_else(|| req.get_i64("max_tokens"))
-        .unwrap_or(-1);
+    let (raw_n, n_param) = if let Some(v) = req.get("n_predict").filter(|v| !v.is_null()) {
+        (v.as_i64().unwrap_or(-1), "n_predict")
+    } else if let Some(v) = req.get("max_tokens").filter(|v| !v.is_null()) {
+        (v.as_i64().unwrap_or(-1), "max_tokens")
+    } else {
+        (-1, "n_predict")
+    };
     let max_new = if raw_n < 0 {
-        (ctx - ids.len()).max(1)
+        room
     } else if raw_n == 0 {
         0
+    } else if (raw_n as usize) > room {
+        if state.config.fit_max_tokens {
+            room
+        } else {
+            return send_post_error(
+                stream,
+                "/completion",
+                400,
+                &format!(
+                    "prompt ({} tokens) + {n_param} ({raw_n}) exceeds context length ({ctx} tokens; max {room} completion tokens available)",
+                    ids.len()
+                ),
+                Some(n_param),
+                Some("context_length_exceeded"),
+            );
+        }
     } else {
-        (raw_n as usize).min(ctx - ids.len())
+        raw_n as usize
     };
 
     let want_stream = req.get_bool("stream").unwrap_or(false);
@@ -3161,7 +3181,8 @@ fn handle_openai_completions(
     let want_lp = sampling.logprobs.is_some();
     let mut lp_entries: Vec<JsonValue> = Vec::new();
     let ctx = state.reported_ctx();
-    if ids.len() >= ctx {
+    let room = ctx.saturating_sub(CTX_SLACK).saturating_sub(ids.len());
+    if room == 0 {
         return send_post_error(
             stream,
             "/v1/completions",
@@ -3171,16 +3192,35 @@ fn handle_openai_completions(
             Some("context_length_exceeded"),
         );
     }
-    let raw_n = req
-        .get_i64("max_tokens")
-        .or_else(|| req.get_i64("n_predict"))
-        .unwrap_or(256);
-    let max_new = if raw_n < 0 {
-        (ctx - ids.len()).max(1)
-    } else if raw_n == 0 {
-        0
+    let (explicit_n, n_param) = if let Some(v) = req.get("max_tokens").filter(|v| !v.is_null()) {
+        (v.as_i64(), "max_tokens")
+    } else if let Some(v) = req.get("n_predict").filter(|v| !v.is_null()) {
+        (v.as_i64(), "n_predict")
     } else {
-        (raw_n as usize).min(ctx - ids.len())
+        (None, "max_tokens")
+    };
+    let max_new = match explicit_n {
+        None => 256usize.min(room),
+        Some(n) if n < 0 => room,
+        Some(0) => 0,
+        Some(n) if (n as usize) > room => {
+            if state.config.fit_max_tokens {
+                room
+            } else {
+                return send_post_error(
+                    stream,
+                    "/v1/completions",
+                    400,
+                    &format!(
+                        "prompt ({} tokens) + {n_param} ({n}) exceeds context length ({ctx} tokens; max {room} completion tokens available)",
+                        ids.len()
+                    ),
+                    Some(n_param),
+                    Some("context_length_exceeded"),
+                );
+            }
+        }
+        Some(n) => n as usize,
     };
 
     let want_stream = req.get_bool("stream").unwrap_or(false);
@@ -3617,29 +3657,71 @@ fn render_and_encode_ids(
     }
 }
 
+struct ChatPrepError {
+    message: String,
+    param: Option<&'static str>,
+    code: Option<&'static str>,
+}
+
 fn prepare_chat(
     messages: &[JsonValue],
     tools: Option<Vec<JsonValue>>,
     kw: &crate::frontend::TemplateKwargs,
     req: &JsonValue,
     state: &ServiceState,
-    raw_max_tokens: i64,
+    max_tokens: Option<(i64, &'static str)>,
     force: Option<String>,
-) -> Result<PreparedChat, String> {
-    let (sampling, stops) = parse_sampling_from_req(req, &state.config.sampling)?;
+) -> Result<PreparedChat, ChatPrepError> {
+    let (sampling, stops) =
+        parse_sampling_from_req(req, &state.config.sampling).map_err(|e| ChatPrepError {
+            message: e,
+            param: None,
+            code: None,
+        })?;
     let (ids, thinking, vision) =
-        render_and_encode_chat(messages, tools.as_deref(), kw, state, force.as_deref())?;
+        render_and_encode_chat(messages, tools.as_deref(), kw, state, force.as_deref()).map_err(
+            |e| {
+                let code = crate::frontend::content_err_code(&e);
+                ChatPrepError {
+                    message: e,
+                    param: None,
+                    code,
+                }
+            },
+        )?;
     let ctx = state.reported_ctx();
-    if ids.len() >= ctx {
-        return Err(format!(
-            "prompt ({} tokens) exceeds context length ({ctx} tokens)",
-            ids.len()
-        ));
+    let room = ctx.saturating_sub(CTX_SLACK).saturating_sub(ids.len());
+    if room == 0 {
+        return Err(ChatPrepError {
+            message: format!(
+                "prompt ({} tokens) exceeds context length ({ctx} tokens)",
+                ids.len()
+            ),
+            param: Some("messages"),
+            code: Some("context_length_exceeded"),
+        });
     }
-    let max_new = if raw_max_tokens <= 0 {
-        (ctx - ids.len()).max(1)
-    } else {
-        (raw_max_tokens as usize).min(ctx - ids.len())
+    let max_new = match max_tokens {
+        Some((raw, param_name)) if raw > 0 => {
+            let requested = raw as usize;
+            if requested > room {
+                if state.config.fit_max_tokens {
+                    room
+                } else {
+                    return Err(ChatPrepError {
+                        message: format!(
+                            "prompt ({} tokens) + {param_name} ({requested}) exceeds context length ({ctx} tokens; max {room} completion tokens available)",
+                            ids.len()
+                        ),
+                        param: Some(param_name),
+                        code: Some("context_length_exceeded"),
+                    });
+                }
+            } else {
+                requested
+            }
+        }
+        _ => room,
     };
     Ok(PreparedChat {
         ids,
@@ -4155,10 +4237,38 @@ fn handle_openai_chat(
             );
         }
     };
-    let raw_max = req
-        .get_i64("max_completion_tokens")
-        .or_else(|| req.get_i64("max_tokens"))
-        .unwrap_or(0);
+    let max_tokens_spec = if let Some(v) = req.get("max_completion_tokens").filter(|v| !v.is_null())
+    {
+        match v.as_i64() {
+            Some(n) => Some((n, "max_completion_tokens")),
+            None => {
+                return send_post_error(
+                    stream,
+                    "/v1/chat/completions",
+                    400,
+                    "max_completion_tokens must be an integer",
+                    Some("max_completion_tokens"),
+                    None,
+                );
+            }
+        }
+    } else if let Some(v) = req.get("max_tokens").filter(|v| !v.is_null()) {
+        match v.as_i64() {
+            Some(n) => Some((n, "max_tokens")),
+            None => {
+                return send_post_error(
+                    stream,
+                    "/v1/chat/completions",
+                    400,
+                    "max_tokens must be an integer",
+                    Some("max_tokens"),
+                    None,
+                );
+            }
+        }
+    } else {
+        None
+    };
     if json_schema.is_some() && (tools.as_ref().is_some_and(|t| !t.is_empty()) || force.is_some()) {
         return send_post_error(
             stream,
@@ -4169,11 +4279,17 @@ fn handle_openai_chat(
             None,
         );
     }
-    let mut prep = match prepare_chat(&messages, tools, &kw, req, state, raw_max, force) {
+    let mut prep = match prepare_chat(&messages, tools, &kw, req, state, max_tokens_spec, force) {
         Ok(p) => p,
-        Err(e) => {
-            let code = crate::frontend::content_err_code(&e);
-            return send_post_error(stream, "/v1/chat/completions", 400, &e, None, code);
+        Err(err) => {
+            return send_post_error(
+                stream,
+                "/v1/chat/completions",
+                400,
+                &err.message,
+                err.param,
+                err.code,
+            );
         }
     };
     prep.sampling.logprobs = match crate::logprobs::parse_request(req, true, state) {
@@ -4549,15 +4665,22 @@ fn handle_responses(
         Err(e) => return write_json(stream, e.status, &e.to_body(), &[]),
     };
     let raw_max = req.get_i64("max_output_tokens").unwrap_or(0);
-    let prep = match prepare_chat(&messages, tools, &kw, req, state, raw_max, None) {
+    let prep = match prepare_chat(
+        &messages,
+        tools,
+        &kw,
+        req,
+        state,
+        Some((raw_max, "max_output_tokens")),
+        None,
+    ) {
         Ok(p) => p,
-        Err(e) => {
-            let code = if e.contains("context") {
-                Some("context_length_exceeded")
-            } else {
-                crate::frontend::content_err_code(&e)
+        Err(err) => {
+            let param = match err.param {
+                Some("messages") | None => Some("input"),
+                other => other,
             };
-            let body = responses_error_body(&e, "invalid_request_error", Some("input"), code);
+            let body = responses_error_body(&err.message, "invalid_request_error", param, err.code);
             return write_json(stream, 400, &body, &[]);
         }
     };
@@ -4713,9 +4836,26 @@ fn handle_anthropic_messages(
         }
     };
     let raw_max = req.get_i64("max_tokens").unwrap_or(0);
-    let prep = match prepare_chat(&messages, tools, &kw, req, state, raw_max, force) {
+    let prep = match prepare_chat(
+        &messages,
+        tools,
+        &kw,
+        req,
+        state,
+        Some((raw_max, "max_tokens")),
+        force,
+    ) {
         Ok(p) => p,
-        Err(e) => return send_post_error(stream, "/v1/messages", 400, &e, None, None),
+        Err(err) => {
+            return send_post_error(
+                stream,
+                "/v1/messages",
+                400,
+                &err.message,
+                err.param,
+                err.code,
+            );
+        }
     };
 
     let want_stream = req.get_bool("stream").unwrap_or(false);

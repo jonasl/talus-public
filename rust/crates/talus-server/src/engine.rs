@@ -549,10 +549,15 @@ pub trait Engine: Send + Sync {
     }
 }
 
+/// Context slack reserved by the inference engines (`generate.cpp`, `qwen4exp`, `laguna`, `mimo`):
+/// all engines reject `prompt_tokens + max_new + CTX_SLACK > max_context` (matching `CTX_SLACK = 8` in `serve/server.py`).
+pub const CTX_SLACK: usize = 8;
+
 #[derive(Clone, Debug)]
 struct MockState {
     turn: usize,
     last_prompt: Vec<u32>,
+    last_max_new: usize,
     /// Multi-conversation prefix cache history (snapshots of prompt and prompt+reply).
     cache_snapshots: Vec<Vec<u32>>,
     saved_slots: HashMap<PathBuf, Vec<u32>>,
@@ -650,6 +655,7 @@ impl ScriptedMockEngine {
             state: Mutex::new(MockState {
                 turn: 0,
                 last_prompt: Vec::new(),
+                last_max_new: 0,
                 cache_snapshots: Vec::new(),
                 saved_slots: HashMap::new(),
             }),
@@ -681,6 +687,10 @@ impl ScriptedMockEngine {
 
     pub fn set_max_context(&self, ctx: usize) {
         self.max_context.store(ctx.max(1), Ordering::Relaxed);
+    }
+
+    pub fn last_max_new(&self) -> usize {
+        self.state.lock().unwrap().last_max_new
     }
 
     pub fn set_scripts(&self, scripts: Vec<String>) {
@@ -1079,11 +1089,19 @@ impl Engine for ScriptedMockEngine {
         self.load()?;
         self.cancelled.store(false, Ordering::Relaxed);
         let prompt_len = req.prompt_ids.len();
+        let ctx = self.max_context();
+        if prompt_len + req.max_new_tokens + CTX_SLACK > ctx {
+            return Err(EngineError::InvalidRequest(format!(
+                "prompt ({prompt_len} tokens) + max_new ({}) exceeds the context ({ctx})",
+                req.max_new_tokens
+            )));
+        }
 
         let (script_tokens, reused) = {
             let scripts = self.scripts.lock().unwrap();
             let mut st = self.state.lock().unwrap();
             st.last_prompt = req.prompt_ids.clone();
+            st.last_max_new = req.max_new_tokens;
             *self.last_json_schema.lock().unwrap() = req.sampling.json_schema.clone();
 
             let fixed = *self.fixed_cache_n.lock().unwrap();

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -1333,10 +1333,91 @@ fn parse_score_cmd(line: &str) -> Result<ScoreRequest, String> {
     })
 }
 
+/// Every engine line after `READY` reaches its consumer through here: a dedicated reader thread
+/// drains stdout into `lines` so a request takes engine output off a queue instead of blocking on
+/// the pipe itself (the mirror image of the engine's own stdin reader thread). `ended` poisons the
+/// bus: `recv` still yields any buffered line and only then reports the close, which is how a
+/// request reading a real pipe sees it - remaining output first, EOF last.
+struct EngineBus {
+    lines: Mutex<std::collections::VecDeque<String>>,
+    signal: std::sync::Condvar,
+    ended: AtomicBool,
+    /// The stdout read error that ended the stream, if it was not a clean EOF; `recv` hands it to
+    /// the next consumer, the way an inline read would have raised it.
+    read_err: Mutex<Option<String>>,
+}
+
+impl EngineBus {
+    /// Start the thread that owns the engine's stdout; it feeds the returned bus until EOF.
+    fn spawn<R: std::io::Read + Send + 'static>(reader: BufReader<R>) -> Arc<EngineBus> {
+        let bus = Arc::new(EngineBus {
+            lines: Mutex::new(std::collections::VecDeque::new()),
+            signal: std::sync::Condvar::new(),
+            ended: AtomicBool::new(false),
+            read_err: Mutex::new(None),
+        });
+        let feeding = Arc::clone(&bus);
+        let result = thread::Builder::new()
+            .name("talus-engine-stdout".to_string())
+            .spawn(move || {
+                let mut reader = reader;
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            let taken = std::mem::take(&mut line);
+                            // No bound: the engine prints only while a request runs, and a consumer
+                            // that vanished takes the process down with its `quit_and_wait`.
+                            feeding.lines.lock().unwrap().push_back(taken);
+                            feeding.signal.notify_one();
+                        }
+                        Err(e) => {
+                            *feeding.read_err.lock().unwrap() = Some(format!("{e}"));
+                            break;
+                        }
+                    }
+                }
+                feeding.ended.store(true, Ordering::SeqCst);
+                feeding.signal.notify_all();
+            });
+        match result {
+            Ok(_) => bus,
+            Err(e) => {
+                *bus.read_err.lock().unwrap() = Some(format!("stdout reader thread: {e}"));
+                bus.ended.store(true, Ordering::SeqCst);
+                bus
+            }
+        }
+    }
+
+    /// The next engine line, waiting while none has arrived. `Ok(None)` means stdout hit EOF and
+    /// the queue drained - the engine is gone or going.
+    fn recv(&self) -> Result<Option<String>, EngineError> {
+        let mut q = self.lines.lock().unwrap();
+        loop {
+            if let Some(line) = q.pop_front() {
+                return Ok(Some(line));
+            }
+            if self.ended.load(Ordering::SeqCst) {
+                return match self.read_err.lock().unwrap().as_ref() {
+                    Some(e) => Err(EngineError::EngineDied(format!(
+                        "engine stdout read failed: {e}"
+                    ))),
+                    None => Ok(None),
+                };
+            }
+            q = self.signal.wait(q).unwrap();
+        }
+    }
+}
+
 struct SubprocessHandle {
     child: Child,
     stdin: Arc<Mutex<EngineStdin>>,
-    stdout: BufReader<ChildStdout>,
+    /// The engine's post-READY lines, delivered by the thread [`EngineBus::spawn`] started.
+    bus: Arc<EngineBus>,
     /// Keeps the engine's keeper thread alive (see [`spawn_kept`]); declared last, so it drops after `child`.
     _keeper: std::sync::mpsc::Sender<()>,
 }
@@ -1683,7 +1764,7 @@ impl StdioSubprocessEngine {
             SubprocessHandle {
                 child,
                 stdin: Arc::new(Mutex::new(EngineStdin(Some(stdin)))),
-                stdout: reader,
+                bus: EngineBus::spawn(reader),
                 _keeper: keeper,
             },
             Ready {
@@ -1859,6 +1940,34 @@ impl StdioSubprocessEngine {
         &self.info
     }
 
+    /// Batch slots the engine will run (`INFO batch_slots=`, absent when the engine runs one request at a
+    /// time): the number of conversations the `BGEN` protocol can hold open at once.
+    pub fn batch_slots(&self) -> usize {
+        self.info
+            .get("batch_slots")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Whether the engine keeps a finished slot's conversation cached (`INFO slot_cache=`), so a follow-up
+    /// request can be re-admitted to it without re-prompting.
+    pub fn slot_cache(&self) -> bool {
+        self.info
+            .get("slot_cache")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    }
+
+    /// Pipelined slot groups the engine resolved (`INFO batch_groups=`, 1 when there is no split):
+    /// the slot order that spreads requests across groups, and whether a window spans a slot's group.
+    pub fn batch_groups(&self) -> usize {
+        self.info
+            .get("batch_groups")
+            .and_then(|v| v.parse().ok())
+            .filter(|g| *g > 0)
+            .unwrap_or(1)
+    }
+
     pub fn exe(&self) -> &Path {
         &self.exe
     }
@@ -1897,18 +2006,12 @@ impl StdioSubprocessEngine {
                 .map_err(|e| EngineError::EngineDied(format!("{STDIN_WRITE_FAILED}: {e}")))?;
         }
         let mut positions = Vec::with_capacity(req.continuation_ids.len());
-        let mut line = String::new();
         loop {
-            line.clear();
-            let n = handle
-                .stdout
-                .read_line(&mut line)
-                .map_err(|e| EngineError::EngineDied(format!("engine stdout read failed: {e}")))?;
-            if n == 0 {
+            let Some(line) = handle.bus.recv()? else {
                 return Err(EngineError::EngineDied(
                     "the engine process ended unexpectedly".to_string(),
                 ));
-            }
+            };
             let trimmed = line.trim();
             if let Some(rest) = trimmed.strip_prefix("S ") {
                 let p = ScorePosition::parse_s(rest).ok_or_else(|| {
@@ -1999,7 +2102,6 @@ impl StdioSubprocessEngine {
 
         let mut reused = 0usize;
         let mut stop_sent = false;
-        let mut line = String::new();
         let mut pending_lp: Option<TokenLogprob> = None;
 
         // nothing from the engine for this request yet
@@ -2013,12 +2115,7 @@ impl StdioSubprocessEngine {
                 }
                 stop_sent = true;
             }
-            line.clear();
-            let n = handle
-                .stdout
-                .read_line(&mut line)
-                .map_err(|e| EngineError::EngineDied(format!("engine stdout read failed: {e}")))?;
-            if n == 0 {
+            let Some(line) = handle.bus.recv()? else {
                 // no word from the engine right after the write: it was on its way out when the command arrived
                 let resend = !answered && written_at.elapsed() <= RESEND_WINDOW;
                 return Err(EngineError::EngineDied(if resend {
@@ -2026,7 +2123,7 @@ impl StdioSubprocessEngine {
                 } else {
                     "the engine process ended unexpectedly".to_string()
                 }));
-            }
+            };
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
@@ -2348,7 +2445,7 @@ impl Engine for StdioSubprocessEngine {
                 .and_then(|_| stdin.flush())
                 .map_err(|e| EngineError::EngineDied(format!("SAVE write failed: {e}")))?;
         }
-        let (n, bytes, ms) = read_session_reply(&mut handle.stdout, "SAVE", "SAVED")?;
+        let (n, bytes, ms) = read_session_reply_on(&mut || handle.bus.recv(), "SAVE", "SAVED")?;
         let written = bytes.unwrap_or_else(|| {
             std::fs::metadata(path)
                 .map(|m| m.len() as usize)
@@ -2374,7 +2471,8 @@ impl Engine for StdioSubprocessEngine {
                 .and_then(|_| stdin.flush())
                 .map_err(|e| EngineError::EngineDied(format!("RESTORE write failed: {e}")))?;
         }
-        let (n, bytes, ms) = read_session_reply(&mut handle.stdout, "RESTORE", "RESTORED")?;
+        let (n, bytes, ms) =
+            read_session_reply_on(&mut || handle.bus.recv(), "RESTORE", "RESTORED")?;
         let read_bytes = bytes.unwrap_or_else(|| {
             std::fs::metadata(path)
                 .map(|m| m.len() as usize)
@@ -2395,16 +2493,17 @@ impl Engine for StdioSubprocessEngine {
                 .and_then(|_| stdin.flush())
                 .map_err(|e| EngineError::EngineDied(format!("CLEAR write failed: {e}")))?;
         }
-        let mut line = String::new();
-        handle
-            .stdout
-            .read_line(&mut line)
-            .map_err(|e| EngineError::EngineDied(format!("CLEAR read failed: {e}")))?;
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("CLEARED") {
-            Ok(rest.trim().parse::<usize>().unwrap_or(0))
-        } else {
-            Ok(0)
+        // an unanswered CLEAR (EOF, or a word we do not know) reads as zero cleared, as the inline read did
+        match handle.bus.recv()? {
+            Some(line) => {
+                let trimmed = line.trim();
+                if let Some(rest) = trimmed.strip_prefix("CLEARED") {
+                    Ok(rest.trim().parse::<usize>().unwrap_or(0))
+                } else {
+                    Ok(0)
+                }
+            }
+            None => Ok(0),
         }
     }
 
@@ -2421,18 +2520,12 @@ impl Engine for StdioSubprocessEngine {
                 .map_err(|e| EngineError::EngineDied(format!("VGEOM write failed: {e}")))?;
         }
         // progress lines can sit between the command and the answer; only VGEOM/ERR settle it
-        let mut line = String::new();
         loop {
-            line.clear();
-            let n = handle
-                .stdout
-                .read_line(&mut line)
-                .map_err(|e| EngineError::EngineDied(format!("VGEOM read failed: {e}")))?;
-            if n == 0 {
+            let Some(line) = handle.bus.recv()? else {
                 return Err(EngineError::EngineDied(
                     "engine exited during VGEOM".to_string(),
                 ));
-            }
+            };
             let trimmed = line.trim();
             let mut f = trimmed.split_whitespace();
             match f.next().unwrap_or("") {
@@ -2458,22 +2551,18 @@ impl Engine for StdioSubprocessEngine {
 /// Read the engine's reply to `SAVE` / `RESTORE` (`ok` = `SAVED` / `RESTORED`, followed by the token count and
 /// optionally the bytes and milliseconds). Engines with a session manager (Laguna, Flash-Next) print progress lines
 /// first (`SESSION done total`, `SWAIT ...`) and answer failures with `SERR kind 0 why`; others answer `ERR why`.
-fn read_session_reply<R: BufRead>(
-    r: &mut R,
+/// `recv` yields engine lines, `Ok(None)` at their end.
+fn read_session_reply_on(
+    recv: &mut dyn FnMut() -> Result<Option<String>, EngineError>,
     cmd: &str,
     ok: &str,
 ) -> Result<(usize, Option<usize>, Option<f64>), EngineError> {
-    let mut line = String::new();
     loop {
-        line.clear();
-        let n = r
-            .read_line(&mut line)
-            .map_err(|e| EngineError::EngineDied(format!("{cmd} read failed: {e}")))?;
-        if n == 0 {
+        let Some(line) = recv()? else {
             return Err(EngineError::EngineDied(format!(
                 "engine exited during {cmd}"
             )));
-        }
+        };
         let trimmed = line.trim();
         let word = trimmed.split_whitespace().next().unwrap_or("");
         if word.is_empty() || word == "SESSION" || word == "SWAIT" {
@@ -2624,15 +2713,73 @@ impl Drop for StdioSubprocessEngine {
 }
 
 #[cfg(test)]
+mod engine_bus_tests {
+    use super::{EngineBus, EngineError};
+    use std::io::BufReader;
+
+    #[test]
+    fn lines_arrive_in_order_and_eof_repeats() {
+        let data = b"T 1\nT 2\nDONE 1 1 0 0 stop\n".to_vec();
+        let bus = EngineBus::spawn(BufReader::new(std::io::Cursor::new(data)));
+        assert_eq!(bus.recv().unwrap().as_deref(), Some("T 1\n"));
+        assert_eq!(bus.recv().unwrap().as_deref(), Some("T 2\n"));
+        assert_eq!(bus.recv().unwrap().as_deref(), Some("DONE 1 1 0 0 stop\n"));
+        assert_eq!(bus.recv().unwrap(), None);
+        assert_eq!(bus.recv().unwrap(), None);
+    }
+
+    /// Hands out its bytes once, then fails every read: the engine pipe dying mid-stream.
+    struct BreaksAfterFirstRead {
+        data: Vec<u8>,
+        delivered: bool,
+    }
+
+    impl std::io::Read for BreaksAfterFirstRead {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.delivered {
+                return Err(std::io::Error::other("simulated pipe break"));
+            }
+            self.delivered = true;
+            let n = buf.len().min(self.data.len());
+            buf[..n].copy_from_slice(&self.data[..n]);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    /// Output the reader thread had already buffered is delivered before the failure it read after:
+    /// a consumer sees the engine's last words, then the error, never the other way around.
+    fn buffered_lines_precede_a_later_read_error() {
+        let data = b"T 1\nT 2\n".to_vec();
+        let inner = BreaksAfterFirstRead {
+            data,
+            delivered: false,
+        };
+        let bus = EngineBus::spawn(BufReader::new(inner));
+        assert_eq!(bus.recv().unwrap().as_deref(), Some("T 1\n"));
+        assert_eq!(bus.recv().unwrap().as_deref(), Some("T 2\n"));
+        assert!(matches!(bus.recv(), Err(EngineError::EngineDied(_))));
+    }
+}
+
+#[cfg(test)]
 mod session_reply_tests {
-    use super::{read_session_reply, EngineError};
-    use std::io::Cursor;
+    use super::{read_session_reply_on, EngineError};
+
+    /// A `recv` source scripted from engine output: one line per call, then EOF.
+    fn line_source(script: &str) -> impl FnMut() -> Result<Option<String>, EngineError> {
+        let mut lines = script.lines().map(str::to_string).collect::<Vec<_>>();
+        lines.reverse();
+        move || {
+            let line = lines.pop();
+            Ok(line)
+        }
+    }
 
     #[test]
     fn plain_reply() {
-        let mut r = Cursor::new("SAVED 120\n");
         assert_eq!(
-            read_session_reply(&mut r, "SAVE", "SAVED").unwrap(),
+            read_session_reply_on(&mut line_source("SAVED 120\n"), "SAVE", "SAVED").unwrap(),
             (120, None, None)
         );
     }
@@ -2640,23 +2787,23 @@ mod session_reply_tests {
     #[test]
     fn progress_lines_are_skipped_and_fields_parsed() {
         // Laguna: SESSION progress, then `SAVED <tokens> <bytes> <ms>`; Flash-Next adds SWAIT.
-        let mut r = Cursor::new(
+        let mut recv = line_source(
             "SESSION 1 4\nSWAIT commit\nSESSION 4 4\n\nRESTORED 9024 441253888 113.3\n",
         );
-        let (n, b, ms) = read_session_reply(&mut r, "RESTORE", "RESTORED").unwrap();
+        let (n, b, ms) = read_session_reply_on(&mut recv, "RESTORE", "RESTORED").unwrap();
         assert_eq!((n, b), (9024, Some(441253888)));
         assert!((ms.unwrap() - 113.3).abs() < 1e-9);
     }
 
     #[test]
     fn serr_and_err_are_request_errors() {
-        let mut r = Cursor::new("SESSION 0 4\nSERR invalid 0 nothing to save\n");
-        match read_session_reply(&mut r, "SAVE", "SAVED") {
+        let mut recv = line_source("SESSION 0 4\nSERR invalid 0 nothing to save\n");
+        match read_session_reply_on(&mut recv, "SAVE", "SAVED") {
             Err(EngineError::InvalidRequest(m)) => assert_eq!(m, "invalid: nothing to save"),
             other => panic!("{other:?}"),
         }
-        let mut r = Cursor::new("ERR no such file\n");
-        match read_session_reply(&mut r, "RESTORE", "RESTORED") {
+        let mut recv = line_source("ERR no such file\n");
+        match read_session_reply_on(&mut recv, "RESTORE", "RESTORED") {
             Err(EngineError::InvalidRequest(m)) => assert_eq!(m, "no such file"),
             other => panic!("{other:?}"),
         }
@@ -2664,14 +2811,12 @@ mod session_reply_tests {
 
     #[test]
     fn eof_and_garbage_are_engine_errors() {
-        let mut r = Cursor::new("SESSION 1 2\n");
         assert!(matches!(
-            read_session_reply(&mut r, "SAVE", "SAVED"),
+            read_session_reply_on(&mut line_source("SESSION 1 2\n"), "SAVE", "SAVED"),
             Err(EngineError::EngineDied(_))
         ));
-        let mut r = Cursor::new("T 5\n");
         assert!(matches!(
-            read_session_reply(&mut r, "SAVE", "SAVED"),
+            read_session_reply_on(&mut line_source("T 5\n"), "SAVE", "SAVED"),
             Err(EngineError::EngineDied(_))
         ));
     }

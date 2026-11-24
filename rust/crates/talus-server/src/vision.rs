@@ -520,6 +520,14 @@ impl VisionEncoder {
         });
         std::fs::create_dir_all(&dir)
             .map_err(|e| format!("vision: cannot create cache dir {}: {e}", dir.display()))?;
+        // the engine's GENI line and the encoder's ENC line are both space-split protocols: a
+        // cache dir with a space (an odd $TMPDIR) would silently misparse a file path
+        if dir.display().to_string().contains(' ') {
+            return Err(format!(
+                "vision: cache dir {} holds a space: the encoder and engine protocols split their lines at spaces",
+                dir.display()
+            ));
+        }
         Ok(Self {
             cfg,
             dir,
@@ -534,6 +542,13 @@ impl VisionEncoder {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Fetch an image's bytes (data URL, `file://`, `http(s)://` via curl, or a plain path) under
+    /// this encoder's fetch timeout — the frontend's intake, so a slow image host costs this
+    /// request its own time, not the encoder's `ENC` clock.
+    pub fn fetch(&self, source: &str) -> Result<Vec<u8>, String> {
+        fetch_bytes(source, self.cfg.enc_timeout_secs)
     }
 
     /// The encoder's embedding width once spawned (the engine verifies it equals `n_embd` when it

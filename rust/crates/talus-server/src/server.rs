@@ -7,8 +7,8 @@ use crate::engine::{
     StdioSubprocessEngine,
 };
 use crate::frontend::{
-    anthropic_to_messages, forced_call, openai_to_messages, render_chat_prompt, tool_choice_of,
-    unmark_think_literals, Event, EventKind, OutputParser, ParserState,
+    anthropic_to_messages, forced_call, openai_to_messages_with_effort, render_chat_prompt,
+    tool_choice_of, unmark_think_literals, Event, EventKind, OutputParser, ParserState,
 };
 use crate::json::{next_hex_id, unix_timestamp_secs, JsonValue};
 use crate::prometheus::{
@@ -81,6 +81,10 @@ pub struct ServiceState {
     pub fingerprint: Arc<crate::fingerprint::Fingerprint>,
     /// `energy` in `/v1/talus/status` (bench extension E5).
     pub energy: Arc<crate::energy::EnergyMeter>,
+    /// vision (vision.rs): the `strata-vision` encoder subprocess and picture cache. `Some` when
+    /// the run config carries a `"vision"` block and its cache dir could be created; it also
+    /// flips the `images` capability bits and the intake of picture content parts.
+    pub vision: Option<Arc<crate::vision::VisionEncoder>>,
     /// HTTP request limits and deadlines (set before the server starts).
     pub http_limits: HttpLimits,
     /// Connections being served now (capped at `http_limits.max_connections`).
@@ -92,6 +96,14 @@ impl ServiceState {
         let literal_tags = talus_text::literal_tags(tokenizer.control_tokens());
         let control = crate::control::ControlState::new(config.control_dir.clone());
         let fingerprint = Arc::new(crate::fingerprint::Fingerprint::new(&config));
+        let vision = config.vision.as_ref().and_then(|vc| {
+            crate::vision::VisionEncoder::new(vc.clone())
+                .map(|v| Some(Arc::new(v)))
+                .unwrap_or_else(|e| {
+                    eprintln!("talus-server: vision is configured but did not start: {e}");
+                    None
+                })
+        });
         let http_limits = HttpLimits {
             max_connections: config.max_connections.max(1),
             ..HttpLimits::default()
@@ -102,6 +114,7 @@ impl ServiceState {
             tokenizer,
             chat_template: None,
             literal_tags,
+            vision,
             metrics: Mutex::new(MetricsState::default()),
             shared_defaults: Mutex::new(JsonValue::empty_obj()),
             running_requests: AtomicUsize::new(0),
@@ -284,7 +297,7 @@ impl ServiceState {
                 JsonValue::obj(vec![
                     ("model", JsonValue::from(self.config.model_name.as_str())),
                     ("max_context", JsonValue::from(self.reported_ctx())),
-                    ("images", JsonValue::from(false)),
+                    ("images", JsonValue::from(self.vision.is_some())),
                     ("health", self.engine_health_json(&health)),
                 ]),
             ),
@@ -494,6 +507,8 @@ fn warm_up(config: &ServerConfig, engine: &dyn Engine, tokenizer: &ByteTokenizer
         },
         stop_tokens: Vec::new(),
         stop_strings: Vec::new(),
+        embeddings: None,
+        img_keys: None,
     };
     let t0 = Instant::now();
     let r = engine.generate(
@@ -1592,7 +1607,7 @@ fn early_reply(
             ("max_context", JsonValue::from(state.reported_ctx())),
             ("context", JsonValue::from(state.reported_ctx())),
             ("model", JsonValue::from(state.config.model_name.as_str())),
-            ("images", JsonValue::from(false)),
+            ("images", JsonValue::from(state.vision.is_some())),
             ("api_key", JsonValue::from(state.config.api_key.is_some())),
             ("image_generation", JsonValue::from(false)),
             ("loaded", JsonValue::from(loaded)),
@@ -1699,7 +1714,13 @@ fn handle_get(
                     JsonValue::obj(vec![
                         (
                             "input_modalities",
-                            JsonValue::Array(vec![JsonValue::from("text")]),
+                            JsonValue::Array({
+                                let mut mods = vec![JsonValue::from("text")];
+                                if state.vision.is_some() {
+                                    mods.push(JsonValue::from("image"));
+                                }
+                                mods
+                            }),
                         ),
                         (
                             "output_modalities",
@@ -2914,6 +2935,8 @@ fn handle_llama_completion(
         sampling,
         stop_tokens: state.tokenizer.stop_tokens.clone(),
         stop_strings: stops.clone(),
+        embeddings: None,
+        img_keys: None,
     };
 
     if !want_stream {
@@ -3166,6 +3189,8 @@ fn handle_openai_completions(
         sampling,
         stop_tokens: state.tokenizer.stop_tokens.clone(),
         stop_strings: stops.clone(),
+        embeddings: None,
+        img_keys: None,
     };
 
     if !want_stream {
@@ -3431,11 +3456,81 @@ struct PreparedChat {
     sampling: SamplingParams,
     stops: Vec<String>,
     force: Option<String>,
+    /// the GENI arguments when this request's pictures were spliced (see `attach_pictures`)
+    vision: Option<VisionHandoff>,
     /// E1 (opt-in): entries of generated tokens not yet handed to the client (chat streams drain it per chunk).
     lp_entries: std::cell::RefCell<Vec<JsonValue>>,
 }
 
+/// The GENI arguments a request's pictures produced: the combine file the engine reads and the
+/// `img_keys=` list. `None` anywhere downstream means the request carried no pictures.
+#[derive(Clone, Debug, PartialEq)]
+struct VisionHandoff {
+    embeddings: String,
+    img_keys: String,
+}
+
+/// Render, encode, and lay this request's pictures: the plain prompt ids, whether thinking is on,
+/// and the GENI arguments when the splice ran.
 fn render_and_encode_chat(
+    messages: &[JsonValue],
+    tools: Option<&[JsonValue]>,
+    kw: &crate::frontend::TemplateKwargs,
+    state: &ServiceState,
+    force: Option<&str>,
+) -> Result<(Vec<u32>, bool, Option<VisionHandoff>), String> {
+    let (mut ids, thinking) = render_and_encode_ids(messages, tools, kw, state, force)?;
+    let handoff = attach_pictures(&mut ids, messages, state)?;
+    Ok((ids, thinking, handoff))
+}
+
+/// The pictures of a vision request (server.py's GENI block, id level): fetch and sniff each
+/// source, encode them with `strata-vision`, then expand each `<|vision_start|><|image_pad|>`
+/// marker pair into that picture's embedding rows. The ids grow, so the caller's context-length
+/// check sees the true prompt size. Err is the client's 400 (a bad picture, an encoder refusal,
+/// or markers and pictures that do not add up).
+fn attach_pictures(
+    ids: &mut Vec<u32>,
+    messages: &[JsonValue],
+    state: &ServiceState,
+) -> Result<Option<VisionHandoff>, String> {
+    let sources = crate::frontend::extract_image_sources(messages);
+    if sources.is_empty() {
+        return Ok(None);
+    }
+    let enc = state.vision.as_ref().ok_or_else(|| {
+        "vision: an encoder is configured but did not start (cache dir?)".to_string()
+    })?;
+    let mut bufs: Vec<Vec<u8>> = Vec::with_capacity(sources.len());
+    for src in &sources {
+        let bytes = enc.fetch(src)?;
+        crate::vision::sniff(&bytes)?;
+        bufs.push(bytes);
+    }
+    let payload = enc.encode_request(&bufs)?;
+    let tok = &state.tokenizer;
+    let pad = tok
+        .encode(crate::tokenizer::IMAGE_PAD, true)
+        .into_iter()
+        .next()
+        .ok_or("the tokenizer has no <|image_pad|> token: this model was not built for images")?;
+    let start = tok
+        .encode(crate::tokenizer::VISION_START, true)
+        .into_iter()
+        .next()
+        .ok_or(
+            "the tokenizer has no <|vision_start|> token: this model was not built for images",
+        )?;
+    let literal = tok.encode(crate::tokenizer::IMAGE_PAD, false);
+    let n_rows: Vec<i64> = payload.pictures.iter().map(|p| p.n).collect();
+    *ids = crate::frontend::splice_image_ids(ids, &n_rows, pad, start, &literal)?;
+    Ok(Some(VisionHandoff {
+        embeddings: payload.combine.to_string_lossy().into_owned(),
+        img_keys: payload.img_keys,
+    }))
+}
+
+fn render_and_encode_ids(
     messages: &[JsonValue],
     tools: Option<&[JsonValue]>,
     kw: &crate::frontend::TemplateKwargs,
@@ -3512,7 +3607,7 @@ fn prepare_chat(
     force: Option<String>,
 ) -> Result<PreparedChat, String> {
     let (sampling, stops) = parse_sampling_from_req(req, &state.config.sampling)?;
-    let (ids, thinking) =
+    let (ids, thinking, vision) =
         render_and_encode_chat(messages, tools.as_deref(), kw, state, force.as_deref())?;
     let ctx = state.reported_ctx();
     if ids.len() >= ctx {
@@ -3534,6 +3629,7 @@ fn prepare_chat(
         sampling,
         stops,
         force,
+        vision,
         lp_entries: std::cell::RefCell::new(Vec::new()),
     })
 }
@@ -3639,6 +3735,8 @@ where
         sampling: prep.sampling.clone(),
         stop_tokens: state.tokenizer.stop_tokens.clone(),
         stop_strings: Vec::new(),
+        embeddings: prep.vision.as_ref().map(|v| v.embeddings.clone()),
+        img_keys: prep.vision.as_ref().map(|v| v.img_keys.clone()),
     };
 
     let emit_filtered = |evs: Vec<Event>,
@@ -3952,13 +4050,14 @@ fn handle_openai_chat(
     req: &JsonValue,
     state: &Arc<ServiceState>,
 ) -> std::io::Result<()> {
-    let (messages, mut tools, mut kw) = match openai_to_messages(req) {
-        Ok(v) => v,
-        Err(e) => {
-            let code = crate::frontend::content_err_code(&e);
-            return send_post_error(stream, "/v1/chat/completions", 400, &e, None, code);
-        }
-    };
+    let (messages, mut tools, mut kw) =
+        match openai_to_messages_with_effort(req, None, state.vision.is_some()) {
+            Ok(v) => v,
+            Err(e) => {
+                let code = crate::frontend::content_err_code(&e);
+                return send_post_error(stream, "/v1/chat/completions", 400, &e, None, code);
+            }
+        };
     // E6: grammar-constrained output. Thinking is turned off for these requests (the whole reply is the JSON value);
     // json_object stays ignored on engines without support (as before), json_schema gets an honest 400 there.
     let client = &*stream;
@@ -4539,17 +4638,18 @@ fn handle_anthropic_count_tokens(
     req: &JsonValue,
     state: &Arc<ServiceState>,
 ) -> std::io::Result<()> {
-    let (messages, tools, kw) =
-        match anthropic_to_messages(req, state.config.anthropic_think_unasked) {
-            Ok(v) => v,
-            Err(e) => {
-                return send_post_error(stream, "/v1/messages/count_tokens", 400, &e, None, None)
-            }
-        };
+    let (messages, tools, kw) = match anthropic_to_messages(
+        req,
+        state.config.anthropic_think_unasked,
+        state.vision.is_some(),
+    ) {
+        Ok(v) => v,
+        Err(e) => return send_post_error(stream, "/v1/messages/count_tokens", 400, &e, None, None),
+    };
     if let Err(e) = parse_sampling_from_req(req, &state.config.sampling) {
         return send_post_error(stream, "/v1/messages/count_tokens", 400, &e, None, None);
     }
-    let (ids, _) = match render_and_encode_chat(&messages, tools.as_deref(), &kw, state, None) {
+    let (ids, _, _) = match render_and_encode_chat(&messages, tools.as_deref(), &kw, state, None) {
         Ok(v) => v,
         Err(e) => return send_post_error(stream, "/v1/messages/count_tokens", 400, &e, None, None),
     };
@@ -4562,11 +4662,14 @@ fn handle_anthropic_messages(
     req: &JsonValue,
     state: &Arc<ServiceState>,
 ) -> std::io::Result<()> {
-    let (messages, mut tools, kw) =
-        match anthropic_to_messages(req, state.config.anthropic_think_unasked) {
-            Ok(v) => v,
-            Err(e) => return send_post_error(stream, "/v1/messages", 400, &e, None, None),
-        };
+    let (messages, mut tools, kw) = match anthropic_to_messages(
+        req,
+        state.config.anthropic_think_unasked,
+        state.vision.is_some(),
+    ) {
+        Ok(v) => v,
+        Err(e) => return send_post_error(stream, "/v1/messages", 400, &e, None, None),
+    };
     let (choice_mode, _) = match tool_choice_of(req.get("tool_choice")) {
         Ok(v) => v,
         Err(e) => {

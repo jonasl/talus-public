@@ -124,6 +124,140 @@ pub fn content_err_code(msg: &str) -> Option<&'static str> {
         .then_some("unsupported_content")
 }
 
+// ------------------------------------------------------------- vision intake (port of serve/frontend.py's IMAGE_PARTS, _image_source, _parts_of, images_of)
+
+/// The content part types that carry a picture (frontend.py's IMAGE_PARTS): OpenAI chat,
+/// Responses-style, and Anthropic spellings.
+pub const IMAGE_PART_TYPES: &[&str] = &["image_url", "input_image", "image"];
+
+/// Is this content field a part list carrying a picture?
+pub fn has_image_parts(content: Option<&JsonValue>) -> bool {
+    content.and_then(|v| v.as_array()).is_some_and(|parts| {
+        parts.iter().any(|p| {
+            p.get_str("type")
+                .is_some_and(|t| IMAGE_PART_TYPES.contains(&t))
+        })
+    })
+}
+
+/// A picture part's source as one string (frontend.py's `_image_source`): a `data:` URL, an
+/// http(s) URL, or a local file path. OpenAI: `{"type":"image_url","image_url":{"url":…}}` (or
+/// `"image_url": "…"`); Responses: `{"type":"input_image","image_url": …}`; Anthropic:
+/// `{"type":"image","source":{"type":"base64",…}}` (folded into a data URL) or a url/path source.
+pub fn image_source(part: &JsonValue) -> String {
+    if part.get_str("type") == Some("image") {
+        return match part.get("source") {
+            Some(src) if src.get_str("type") == Some("base64") => format!(
+                "data:{};base64,{}",
+                src.get_str("media_type").unwrap_or("image/png"),
+                src.get_str("data").unwrap_or("")
+            ),
+            Some(src) => src
+                .get_str("url")
+                .or_else(|| src.get_str("path"))
+                .unwrap_or("")
+                .to_string(),
+            None => String::new(),
+        };
+    }
+    match part.get("image_url") {
+        Some(v) if v.is_object() => v.get_str("url").unwrap_or("").to_string(),
+        Some(v) => v.as_str().unwrap_or("").to_string(),
+        None => String::new(),
+    }
+}
+
+/// Content for the template (`_parts_of`): a plain string when there is no picture — unchanged
+/// flattening, including the 400 refusal of a picture part on a server without a vision encoder —
+/// otherwise the template's list form: `{"type":"text","text":…}` and `{"type":"image","source":…}`
+/// items in part order.
+pub fn content_for_template(
+    content: Option<&JsonValue>,
+    vision_on: bool,
+) -> Result<JsonValue, String> {
+    if !vision_on || !has_image_parts(content) {
+        return text_of_content(content).map(JsonValue::from);
+    }
+    let parts = content
+        .and_then(|v| v.as_array())
+        .expect("has_image_parts checked");
+    let mut items = Vec::new();
+    for p in parts {
+        let t = p.get_str("type").unwrap_or("text");
+        if IMAGE_PART_TYPES.contains(&t) {
+            let src = image_source(p);
+            if src.is_empty() {
+                return Err(format!("vision: the {t} content part carries no source"));
+            }
+            items.push(JsonValue::obj(vec![
+                ("type", JsonValue::from("image")),
+                ("source", JsonValue::from(src.as_str())),
+            ]));
+        } else if t == "refusal" {
+            // as in text_of_content: a refusal replayed from history renders nothing
+        } else if t == "text" || t == "input_text" || t == "output_text" || p.contains_key("text") {
+            items.push(JsonValue::obj(vec![
+                ("type", JsonValue::from("text")),
+                ("text", JsonValue::from(p.get_str("text").unwrap_or(""))),
+            ]));
+        } else {
+            // audio, file, ...: refused as on a text-only server (a v1 gap: a request mixing a
+            // picture and an audio part still refuses the audio)
+            return Err(unsupported_content_msg(t, p));
+        }
+    }
+    Ok(JsonValue::Array(items))
+}
+
+/// The picture sources of a *normalized* conversation, in prompt order (`images_of`): the
+/// `{"type":"image"}` items `content_for_template` produced, message by message. The splice
+/// assigns embeddings in this order, and the renderer lays the markers in the same order.
+pub fn extract_image_sources(messages: &[JsonValue]) -> Vec<String> {
+    let mut out = Vec::new();
+    for m in messages {
+        if let Some(items) = m.get("content").and_then(|c| c.as_array()) {
+            for item in items {
+                if item.get_str("type") == Some("image") {
+                    out.push(item.get_str("source").unwrap_or("").to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The id-level splice of server.py's GENI block: the template writes exactly one `<|image_pad|>`
+/// per picture, right after its `<|vision_start|>`; each such pair expands to that picture's rows
+/// (`pad` repeated `n` times, prompt order). A lone pad is a quoted marker in message text and
+/// re-becomes its plain-BPE bytes (`literal`), as server.py's `parse_special=False` did.
+/// Err: the marker count and the picture count disagree.
+pub fn splice_image_ids(
+    ids: &[u32],
+    n_rows: &[i64],
+    pad: u32,
+    start: u32,
+    literal: &[u32],
+) -> Result<Vec<u32>, String> {
+    let mismatch = || "the prompt and its images do not match".to_string();
+    let mut out = Vec::with_capacity(ids.len());
+    let mut k = 0usize;
+    for (j, &t) in ids.iter().enumerate() {
+        if t == pad && j > 0 && ids[j - 1] == start {
+            let n = *n_rows.get(k).ok_or_else(mismatch)? as usize;
+            out.resize(out.len() + n, pad);
+            k += 1;
+        } else if t == pad {
+            out.extend_from_slice(literal);
+        } else {
+            out.push(t);
+        }
+    }
+    if k != n_rows.len() {
+        return Err(mismatch());
+    }
+    Ok(out)
+}
+
 /// Extract text from a content field (string, array of content parts, or null).
 pub fn text_of_content(content: Option<&JsonValue>) -> Result<String, String> {
     match content {
@@ -312,12 +446,15 @@ pub type NormalizedMessages = (Vec<JsonValue>, Option<Vec<JsonValue>>, TemplateK
 
 /// Convert OpenAI `/v1/chat/completions` request into normalized messages, tools, and template kwargs.
 pub fn openai_to_messages(req: &JsonValue) -> Result<NormalizedMessages, String> {
-    openai_to_messages_with_effort(req, None)
+    openai_to_messages_with_effort(req, None, false)
 }
 
+/// `vision_on` (the server has a vision encoder): picture content parts survive normalization as
+/// `{"type":"image","source":…}` items instead of the 400 refusal; see `content_for_template`.
 pub fn openai_to_messages_with_effort(
     req: &JsonValue,
     default_effort: Option<&str>,
+    vision_on: bool,
 ) -> Result<NormalizedMessages, String> {
     if !req.is_object() {
         return Err("request body must be a JSON object".to_string());
@@ -341,7 +478,23 @@ pub fn openai_to_messages_with_effort(
             .get_str("role")
             .ok_or_else(|| "message is missing 'role'".to_string())?;
         if role == "system" || role == "developer" {
-            let txt = text_of_content(m.get("content"))?;
+            let content = content_for_template(m.get("content"), vision_on)?;
+            if !content.is_str() {
+                // a system message carrying a picture: the items cannot join the merged system
+                // string, so it rides on as its own user turn (image markers survive intact)
+                if !content
+                    .as_str()
+                    .map(|s| s.trim().is_empty())
+                    .unwrap_or(false)
+                {
+                    rest_msgs.push(JsonValue::obj(vec![
+                        ("role", JsonValue::from("user")),
+                        ("content", content),
+                    ]));
+                }
+                continue;
+            }
+            let txt = content.as_str().unwrap_or("").to_string();
             if !txt.trim().is_empty() {
                 if rest_msgs.is_empty() {
                     sys_parts.push(txt);
@@ -354,10 +507,10 @@ pub fn openai_to_messages_with_effort(
             }
             continue;
         }
-        let content_txt = text_of_content(m.get("content"))?;
+        let content_txt = content_for_template(m.get("content"), vision_on)?;
         let mut msg = JsonValue::obj(vec![
             ("role", JsonValue::from(role)),
-            ("content", JsonValue::from(content_txt.as_str())),
+            ("content", content_txt.clone()),
         ]);
         if role == "assistant" {
             if let Some(rc) = m
@@ -428,8 +581,9 @@ pub fn openai_to_messages_with_effort(
                     );
                 }
             }
-            if content_txt.contains(THINK_CLOSE) && !msg.contains_key("reasoning_content") {
-                if let Some((before, after)) = content_txt.split_once(THINK_CLOSE) {
+            let content_str = content_txt.as_str().unwrap_or("");
+            if content_str.contains(THINK_CLOSE) && !msg.contains_key("reasoning_content") {
+                if let Some((before, after)) = content_str.split_once(THINK_CLOSE) {
                     let r = before.trim_start_matches(THINK_OPEN).trim();
                     msg.insert("reasoning_content", JsonValue::from(r));
                     msg.insert("content", JsonValue::from(after.trim_start()));
@@ -520,14 +674,16 @@ pub fn openai_to_messages_with_effort(
 pub fn anthropic_to_messages(
     req: &JsonValue,
     think_unasked: bool,
+    vision_on: bool,
 ) -> Result<NormalizedMessages, String> {
-    anthropic_to_messages_with_effort(req, think_unasked, None)
+    anthropic_to_messages_with_effort(req, think_unasked, None, vision_on)
 }
 
 pub fn anthropic_to_messages_with_effort(
     req: &JsonValue,
     think_unasked: bool,
     default_effort: Option<&str>,
+    vision_on: bool,
 ) -> Result<NormalizedMessages, String> {
     if !req.is_object() {
         return Err("request body must be a JSON object".to_string());
@@ -600,10 +756,18 @@ pub fn anthropic_to_messages_with_effort(
         let mut thinking_parts: Vec<String> = Vec::new();
         let mut calls: Vec<JsonValue> = Vec::new();
         let mut tool_results: Vec<String> = Vec::new();
+        // blocks in order, as template items (text + pictures); used as content only if a picture
+        // is present — text-only messages keep their flat string, as before
+        let mut content_seq: Vec<JsonValue> = Vec::new();
+        let mut has_image = false;
 
         for b in &blocks {
             if let Some(s) = b.as_str() {
                 text_parts.push(s.to_string());
+                content_seq.push(JsonValue::obj(vec![
+                    ("type", JsonValue::from("text")),
+                    ("text", JsonValue::from(s)),
+                ]));
                 continue;
             }
             if !b.is_object() {
@@ -616,6 +780,10 @@ pub fn anthropic_to_messages_with_effort(
                         .get_str("text")
                         .ok_or_else(|| "text block is missing 'text'".to_string())?;
                     text_parts.push(t.to_string());
+                    content_seq.push(JsonValue::obj(vec![
+                        ("type", JsonValue::from("text")),
+                        ("text", JsonValue::from(t)),
+                    ]));
                 }
                 "thinking" => {
                     if let Some(th) = b.get_str("thinking") {
@@ -647,6 +815,17 @@ pub fn anthropic_to_messages_with_effort(
                     };
                     tool_results.push(txt);
                 }
+                "image" if vision_on => {
+                    let src = image_source(b);
+                    if src.is_empty() {
+                        return Err("vision: the image block carries no source".to_string());
+                    }
+                    has_image = true;
+                    content_seq.push(JsonValue::obj(vec![
+                        ("type", JsonValue::from("image")),
+                        ("source", JsonValue::from(src)),
+                    ]));
+                }
                 "image" | "document" | "audio" | "video" | "file" => {
                     return Err(unsupported_content_msg(btype, b));
                 }
@@ -664,11 +843,19 @@ pub fn anthropic_to_messages_with_effort(
         if !text_parts.is_empty()
             || !thinking_parts.is_empty()
             || !calls.is_empty()
+            || has_image
             || blocks.is_empty()
         {
             let mut msg = JsonValue::obj(vec![
                 ("role", JsonValue::from(role)),
-                ("content", JsonValue::from(text_parts.join(""))),
+                (
+                    "content",
+                    if has_image {
+                        JsonValue::Array(content_seq)
+                    } else {
+                        JsonValue::from(text_parts.join(""))
+                    },
+                ),
             ]);
             if !thinking_parts.is_empty() {
                 msg.insert(
@@ -739,6 +926,46 @@ const TEMPLATE_SPECIALS: &[&str] = &[
 
 /// Render chat messages and tools into a Qwen/Strata chat template prompt string
 /// with sentinel markers around user/tool literal special tokens.
+/// Wrap the template's special tokens found in user text so rendering cannot split them, and the
+/// encoder can later lay them as literals (the `MARK_OPEN`/`MARK_CLOSE` sentinels).
+fn mark_specials(s: &str) -> String {
+    let mut res = s.to_string();
+    for &tok in TEMPLATE_SPECIALS {
+        if res.contains(tok) {
+            let replacement = format!("{MARK_OPEN}{tok}{MARK_CLOSE}");
+            res = res.replace(tok, &replacement);
+        }
+    }
+    res
+}
+
+/// The renderer's view of a normalized message's content: text as mark-protected text; the
+/// `{"type":"image"}` items vision intake produced render as the model's own
+/// `<|vision_start|><|image_pad|><|vision_end|>` triple — inserted raw, not mark-wrapped, so the
+/// pad encodes as the special token and `splice_image_ids` can find and expand it. (server.py left
+/// this to a VL-aware jinja template; our fallback renderer writes the markers itself, and the
+/// jinja path passes the item list to the template unchanged.)
+pub fn content_for_render(m: &JsonValue) -> String {
+    let mut out = String::new();
+    match m.get("content") {
+        Some(JsonValue::Str(s)) => out.push_str(&mark_specials(s)),
+        Some(JsonValue::Array(items)) => {
+            for item in items {
+                if item.get_str("type") == Some("image") {
+                    out.push_str(crate::tokenizer::VISION_START);
+                    out.push_str(crate::tokenizer::IMAGE_PAD);
+                    out.push_str(crate::tokenizer::VISION_END);
+                } else if let Some(t) = item.get_str("text") {
+                    out.push_str(&mark_specials(t));
+                }
+            }
+        }
+        Some(JsonValue::Null) | None => {}
+        _ => {}
+    }
+    out
+}
+
 pub fn render_chat_prompt(
     messages: &[JsonValue],
     tools: Option<&[JsonValue]>,
@@ -748,28 +975,20 @@ pub fn render_chat_prompt(
         return String::new();
     }
 
-    let mark_str = |s: &str| -> String {
-        let mut res = s.to_string();
-        for &tok in TEMPLATE_SPECIALS {
-            if res.contains(tok) {
-                let replacement = format!("{MARK_OPEN}{tok}{MARK_CLOSE}");
-                res = res.replace(tok, &replacement);
-            }
-        }
-        res
-    };
+    let mark_str = mark_specials;
 
     let mut sys_count = 0usize;
     let mut merged_system = String::new();
     for (idx, m) in messages.iter().enumerate() {
         let role = m.get_str("role").unwrap_or("");
         if idx == sys_count && (role == "system" || role == "developer") {
-            let content = m.get_str("content").unwrap_or("").trim();
+            let content = content_for_render(m);
+            let content = content.trim();
             if !content.is_empty() {
                 if !merged_system.is_empty() {
                     merged_system.push('\n');
                 }
-                merged_system.push_str(&mark_str(content));
+                merged_system.push_str(content);
             }
             sys_count += 1;
         }
@@ -838,8 +1057,9 @@ pub fn render_chat_prompt(
 
     for (idx, m) in messages.iter().enumerate().skip(sys_count) {
         let role = m.get_str("role").unwrap_or("");
-        let raw_content = m.get_str("content").unwrap_or("").trim();
-        let content = mark_str(raw_content);
+        // Array content reaches here only when vision intake left items in it (a text-only part
+        // list already collapsed to a string); content_for_render lays images as raw markers
+        let content = content_for_render(m).trim().to_string();
         match role {
             "user" | "system" | "developer" => {
                 out.push_str("<|im_start|>user\n");
@@ -1777,7 +1997,7 @@ mod content_part_tests {
         let req = parts(
             r#"{"max_tokens":8,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},{"type":"text","text":"describe"}]}]}"#,
         );
-        let e = match anthropic_to_messages(&req, false) {
+        let e = match anthropic_to_messages(&req, false, false) {
             Err(e) => e,
             Ok(_) => panic!("an Anthropic image block was accepted"),
         };
@@ -1806,7 +2026,7 @@ mod content_part_tests {
                 {"role":"assistant","content":[{"type":"text","text":"ok"}]},
                 {"role":"user","content":"thanks"}]}"##,
         );
-        let (msgs, _, _) = anthropic_to_messages(&req, false).expect("accepted");
+        let (msgs, _, _) = anthropic_to_messages(&req, false, false).expect("accepted");
         let got = roles_and_contents(&msgs);
         let want: Vec<(String, String)> = [
             ("system", "You are Claude Code."),
@@ -1831,7 +2051,7 @@ mod content_part_tests {
                 {"role":"system","content":"  "},
                 {"role":"user","content":"hi"}]}"#,
         );
-        let (msgs, _, _) = anthropic_to_messages(&req, false).expect("accepted");
+        let (msgs, _, _) = anthropic_to_messages(&req, false, false).expect("accepted");
         assert_eq!(
             roles_and_contents(&msgs),
             vec![
@@ -1843,7 +2063,7 @@ mod content_part_tests {
         let req = parts(
             r#"{"max_tokens":8,"messages":[{"role":"system","content":"only"},{"role":"user","content":"hi"}]}"#,
         );
-        let (msgs, _, _) = anthropic_to_messages(&req, false).expect("accepted");
+        let (msgs, _, _) = anthropic_to_messages(&req, false, false).expect("accepted");
         assert_eq!(
             roles_and_contents(&msgs),
             vec![
@@ -1872,7 +2092,7 @@ mod content_part_tests {
                 {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{"path":"a.php"}}]},
                 {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"<?php echo 1;"}]}]}"##,
         );
-        let (msgs, tools, _) = anthropic_to_messages(&req, false).expect("accepted");
+        let (msgs, tools, _) = anthropic_to_messages(&req, false, false).expect("accepted");
         let s_msgs: Vec<serde_json::Value> = msgs.iter().map(to_serde_value).collect();
         let s_tools: Option<Vec<serde_json::Value>> =
             tools.map(|ts| ts.iter().map(to_serde_value).collect());

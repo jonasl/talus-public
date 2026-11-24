@@ -185,6 +185,13 @@ pub struct GenerateRequest {
     pub sampling: SamplingParams,
     pub stop_tokens: Vec<u32>,
     pub stop_strings: Vec<String>,
+    /// vision (vision.rs): the SVE1 embeddings file for this request's pictures, the GENI argument
+    /// that replaces the GEN verb; `None` = no pictures. The path must hold no space: the engine's
+    /// protocol line is space-split.
+    pub embeddings: Option<String>,
+    /// the `img_keys=` value (#2228): each picture's key (16 hex), comma list, prompt order. Only
+    /// sent with `embeddings`; without it the engine matches pictures by embedding hash instead.
+    pub img_keys: Option<String>,
 }
 
 /// E1: one generated token's logprob under the target model at temperature 1 (before sampling filters), and the
@@ -932,6 +939,8 @@ impl ScriptedMockEngine {
                     sampling,
                     stop_tokens: self.tok.stop_tokens.clone(),
                     stop_strings: Vec::new(),
+                    embeddings: None,
+                    img_keys: None,
                 };
                 let cancel = Arc::new(AtomicBool::new(false));
                 let mut emitted_tokens = Vec::new();
@@ -1920,7 +1929,18 @@ impl StdioSubprocessEngine {
             .map(|id| id.to_string())
             .collect::<Vec<_>>()
             .join(",");
-        let cmd = format!("GEN {}{} {}\n", req.max_new_tokens, keys, csv_ids);
+        // pictures: GENI's embeddings file is the first space-split token without an `=`, so it
+        // goes after the sampling keys and before the ids (serve/server.py's head construction)
+        let cmd = match &req.embeddings {
+            Some(path) => match &req.img_keys {
+                Some(k) => format!(
+                    "GENI {}{} img_keys={} {} {}\n",
+                    req.max_new_tokens, keys, k, path, csv_ids
+                ),
+                None => format!("GENI {}{} {} {}\n", req.max_new_tokens, keys, path, csv_ids),
+            },
+            None => format!("GEN {}{} {}\n", req.max_new_tokens, keys, csv_ids),
+        };
         {
             let mut stdin = handle.stdin.lock().unwrap();
             stdin

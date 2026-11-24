@@ -130,10 +130,12 @@ pub fn parse_img_bytes(v: &str) -> Option<Vec<u64>> {
 
 /// What the stdin reader must do after a protocol line: `Some(n)` = read exactly `n` raw bytes (the frame) before the next line.
 /// Only a GENI line in the pixel form (an `@px` token with its `img_px=` key, or the `@raw` form with
-/// `img_bytes=`) carries a frame; a malformed size list = no frame can be framed (the engine
-/// answers ERR and the client's bytes then arrive as lines: documented, the server never sends that).
+/// `img_bytes=`) carries a frame; ditto `BGENI`, the batch slot admission, which the engine rewrites
+/// to a GENI only after this reader has handed the frame over.  A malformed size list = no frame can
+/// be framed (the engine answers ERR and the client's bytes then arrive as lines: documented, the
+/// server never sends that).
 pub fn frame_len(line: &str) -> Option<usize> {
-    if !line.starts_with("GENI ") {
+    if !line.starts_with("GENI ") && !line.starts_with("BGENI ") {
         return None;
     }
     let mut px = None;
@@ -151,7 +153,11 @@ pub fn frame_len(line: &str) -> Option<usize> {
         } else if tok == "@raw" {
             at_raw = true;
             break; // ids follow
-        } else if !tok.contains('=') && tok != "GENI" && !tok.bytes().all(|b| b.is_ascii_digit()) {
+        } else if !tok.contains('=')
+            && tok != "GENI"
+            && tok != "BGENI"
+            && !tok.bytes().all(|b| b.is_ascii_digit())
+        {
             break; // an SVE path: no frame
         }
     }
@@ -775,6 +781,17 @@ mod tests {
         ); // prediction rides along
         assert_eq!(frame_len("GENI 8 img_keys=ab @raw 1"), None); // no img_bytes: ERR, no frame
         assert_eq!(frame_len("GENI 8 img_bytes=ab @raw 1"), None); // malformed
+                                                                   // BGENI (the batch slot admission) frames identically: this reader runs first, and the
+                                                                   // engine's rewrite to GENI happens downstream of the frame it will be handed.
+        assert_eq!(
+            frame_len("BGENI 0 48 img_keys=ab,cd img_bytes=100,200 @raw 1,2"),
+            Some(300)
+        );
+        assert_eq!(
+            frame_len("BGENI 3 8 img_keys=ab img_px=4x2 @px 1,2,3"),
+            Some(24)
+        );
+        assert_eq!(frame_len("BGENI 2 8 /tmp/a.sve 1,2"), None); // SVE path on a slot: no frame
         assert_eq!(parse_img_bytes("10,20"), Some(vec![10, 20]));
         assert_eq!(parse_img_bytes("0"), None);
         assert_eq!(parse_img_bytes(""), None);

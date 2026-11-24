@@ -1838,6 +1838,20 @@ void tk_qwen4exp_p2_add_streams_broadcast(const float* h, const float* e, float*
 void tk_qwen4exp_p2_mmq_run(void* mmq_ctx, const void* w, int32_t type, int64_t w_rows, int64_t w_cols,
                             uint64_t expert_bytes, int32_t n, const void* xq, const int32_t* bounds, const int32_t* ids,
                             int64_t total_rows, int64_t max_rows, float* dst, int64_t ld_dst, void* stream);
+// ---- NPU prefill assist (opt-in via TALUS_NPU_DIR; 0 = inactive/ineligible)
+int tk_qwen4exp_p2_npu_init(void* wt, char* err, size_t err_cap);
+int tk_qwen4exp_p2_npu_gdn_start(void* cs, void* gemm, int64_t layer, const tk_qwen4exp_p2_weight_t* wg,
+                                 const uint16_t* mixed_h, int64_t t_n, int64_t* z_gpu_cols_out);
+void tk_qwen4exp_p2_npu_gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
+                                       const float* gamma, float eps, float* y, uint16_t* y16, int64_t t, void* stream,
+                                       int64_t ld16);
+int tk_qwen4exp_p2_npu_qsa_start(void* cs, void* gemm, int64_t layer, const tk_qwen4exp_p2_weight_t* wq,
+                                 const uint16_t* mixed_h, int64_t t_n, int64_t* q_gpu_cols_out);
+int tk_qwen4exp_p2_npu_qsa_finish(void* cs, float* qf_dev, int64_t t_n);
+int tk_qwen4exp_p2_npu_moe_shexp_start(void* cs, void* gemm, int64_t layer, const tk_qwen4exp_p2_weight_t* wsg,
+                                       const tk_qwen4exp_p2_weight_t* wsu, const uint16_t* mixed_h, int64_t t_n);
+int tk_qwen4exp_p2_npu_moe_shexp_finish(void* cs, uint16_t* sh_h_dev, int64_t t_n);
+void tk_qwen4exp_p2_npu_end_chunk(void);
 // ---- qwen4exp-p2 end ----
 
 // ---- qwen4exp-r1 begin ----

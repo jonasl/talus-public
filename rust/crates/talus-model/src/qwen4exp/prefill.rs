@@ -769,8 +769,21 @@ impl<'a> Ctx<'a> {
         self.m.f16_io == 0 && self.e.bf16x2_env != 0
     }
     fn progress(&self, what: &str, detail: i64, chunk: i64) {
-        let c = cstr(what);
-        unsafe { (self.f.progress_at)(c.as_ptr(), detail, chunk) };
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+        static TEXTS: Mutex<Option<HashMap<String, &'static CStr>>> = Mutex::new(None);
+        let ptr = {
+            let mut g = TEXTS.lock().unwrap_or_else(|e| e.into_inner());
+            let m = g.get_or_insert_with(HashMap::new);
+            if let Some(c) = m.get(what) {
+                c.as_ptr()
+            } else {
+                let c: &'static CStr = Box::leak(cstr(what).into_boxed_c_str());
+                m.insert(what.to_string(), c);
+                c.as_ptr()
+            }
+        };
+        unsafe { (self.f.progress_at)(ptr, detail, chunk) };
     }
     /// bf16_proj: Y = X . W^T for a resident BF16 weight (+ the activations' BF16 remainder when given).
     #[allow(clippy::too_many_arguments)]
@@ -948,6 +961,75 @@ fn pic_ffi() -> Option<&'static PicFfi> {
             embd_rows: l(n, "tk_qwen4exp_p2_embd_rows").ok()?,
             acquire: l(n, "tk_qwen4exp_p2_upring_acquire").ok()?,
             submit: l(n, "tk_qwen4exp_p2_upring_submit").ok()?,
+        })
+    })
+    .as_ref()
+}
+
+/// Optional XDNA2 NPU prefill assist entries (`TALUS_NPU_DIR` opts in).
+#[derive(Clone, Copy)]
+struct NpuFfi {
+    init: unsafe extern "C" fn(*mut c_void, *mut c_char, usize) -> c_int,
+    gdn_start: unsafe extern "C" fn(
+        *mut c_void,
+        *mut c_void,
+        i64,
+        *const TkP2Weight,
+        *const u16,
+        i64,
+        *mut i64,
+    ) -> c_int,
+    gdn_recurrence: unsafe extern "C" fn(
+        *mut f32,
+        *const f32,
+        *const f32,
+        *const f32,
+        *const f32,
+        *const f32,
+        f32,
+        *mut f32,
+        *mut u16,
+        i64,
+        *mut c_void,
+        i64,
+    ),
+    qsa_start: unsafe extern "C" fn(
+        *mut c_void,
+        *mut c_void,
+        i64,
+        *const TkP2Weight,
+        *const u16,
+        i64,
+        *mut i64,
+    ) -> c_int,
+    qsa_finish: unsafe extern "C" fn(*mut c_void, *mut f32, i64) -> c_int,
+    moe_shexp_start: unsafe extern "C" fn(
+        *mut c_void,
+        *mut c_void,
+        i64,
+        *const TkP2Weight,
+        *const TkP2Weight,
+        *const u16,
+        i64,
+    ) -> c_int,
+    moe_shexp_finish: unsafe extern "C" fn(*mut c_void, *mut u16, i64) -> c_int,
+    end_chunk: unsafe extern "C" fn(),
+}
+
+fn npu_ffi() -> Option<&'static NpuFfi> {
+    static F: OnceLock<Option<NpuFfi>> = OnceLock::new();
+    F.get_or_init(|| unsafe {
+        use super::ffi::load_sym_from as l;
+        let n = std::ptr::null_mut();
+        Some(NpuFfi {
+            init: l(n, "tk_qwen4exp_p2_npu_init").ok()?,
+            gdn_start: l(n, "tk_qwen4exp_p2_npu_gdn_start").ok()?,
+            gdn_recurrence: l(n, "tk_qwen4exp_p2_npu_gdn_recurrence").ok()?,
+            qsa_start: l(n, "tk_qwen4exp_p2_npu_qsa_start").ok()?,
+            qsa_finish: l(n, "tk_qwen4exp_p2_npu_qsa_finish").ok()?,
+            moe_shexp_start: l(n, "tk_qwen4exp_p2_npu_moe_shexp_start").ok()?,
+            moe_shexp_finish: l(n, "tk_qwen4exp_p2_npu_moe_shexp_finish").ok()?,
+            end_chunk: l(n, "tk_qwen4exp_p2_npu_end_chunk").ok()?,
         })
     })
     .as_ref()
@@ -1255,6 +1337,24 @@ unsafe fn run_chunks(
     };
     let mut ple_buf = 0usize;
     let dump_dir = env_str("TALUS_FN_DUMP").filter(|v| !v.is_empty());
+    let npu: Option<&'static NpuFfi> = if env_str("TALUS_NPU_DIR")
+        .or_else(|| env_str("GUFO_NPU_DIR"))
+        .is_some_and(|v| !v.is_empty())
+        || (env_str("TALUS_NPU_XCLBIN").is_some_and(|v| !v.is_empty())
+            && env_str("TALUS_NPU_INSTS").is_some_and(|v| !v.is_empty()))
+    {
+        let mut eb = [0 as c_char; 512];
+        let found = npu_ffi().filter(|n| (n.init)(m.wt, eb.as_mut_ptr(), eb.len()) != 0);
+        if found.is_none() && env_first_is("TALUS_NPU_REQUIRED", b'1') {
+            let msg = CStr::from_ptr(eb.as_ptr()).to_string_lossy();
+            return Err(format!(
+                "NPU required (TALUS_NPU_REQUIRED=1) but unavailable: {msg}"
+            ));
+        }
+        found
+    } else {
+        None
+    };
 
     // D3b-2: device pictures set by the Rust serve loop for this request (an in-process encoder's rows); they
     // never reach the C++ structures (embd_rows stays null), so they are taken first
@@ -1969,6 +2069,16 @@ unsafe fn run_chunks(
                         .gdn_state
                         .add(((gdn_index - m.gdn_ord0) * m.gdn_floats) as usize);
                     let conv = state.add(m.gdn_state_floats as usize);
+                    let mut z_gpu_cols = zv;
+                    let npu_z = npu.and_then(|n| {
+                        let mut gc = 0i64;
+                        ((n.gdn_start)(cs, m.gemm, l, &wg, m.mixed_h, t_n, &mut gc) != 0).then(
+                            || {
+                                z_gpu_cols = gc;
+                                n
+                            },
+                        )
+                    });
                     c.native_proj(
                         &wqkv,
                         m.mixed_h,
@@ -1978,15 +2088,39 @@ unsafe fn run_chunks(
                         0,
                         0,
                     )?;
-                    c.native_proj(
-                        &wg,
-                        m.mixed_h,
-                        m.z,
-                        t_n,
-                        || wname(l, "attn_gate.weight"),
-                        0,
-                        0,
-                    )?;
+                    if npu_z.is_some() {
+                        if z_gpu_cols > 0 {
+                            if wg.native_data.is_null() {
+                                return Err(format!(
+                                    "prefill: {} has no native GGUF blocks",
+                                    wname(l, "attn_gate.weight")
+                                ));
+                            }
+                            (f.gemm_native)(
+                                m.gemm,
+                                m.mixed_h,
+                                wg.native_type,
+                                wg.native_data,
+                                m.z,
+                                t_n,
+                                z_gpu_cols,
+                                wg.ne0,
+                                zv,
+                                0.0,
+                                0,
+                            );
+                        }
+                    } else {
+                        c.native_proj(
+                            &wg,
+                            m.mixed_h,
+                            m.z,
+                            t_n,
+                            || wname(l, "attn_gate.weight"),
+                            0,
+                            0,
+                        )?;
+                    }
                     c.bf16_proj(
                         &wa,
                         m.mixed_bf,
@@ -2024,20 +2158,37 @@ unsafe fn run_chunks(
                     } else {
                         0
                     };
-                    (f.gdn_recurrence)(
-                        state,
-                        m.hbuf,
-                        m.gate,
-                        m.beta,
-                        m.z,
-                        wnm.data.cast(),
-                        eps,
-                        m.y,
-                        m.y_h,
-                        t_n,
-                        cs,
-                        ld_y,
-                    );
+                    if let Some(n) = npu_z {
+                        (n.gdn_recurrence)(
+                            state,
+                            m.hbuf,
+                            m.gate,
+                            m.beta,
+                            m.z,
+                            wnm.data.cast(),
+                            eps,
+                            m.y,
+                            m.y_h,
+                            t_n,
+                            cs,
+                            ld_y,
+                        );
+                    } else {
+                        (f.gdn_recurrence)(
+                            state,
+                            m.hbuf,
+                            m.gate,
+                            m.beta,
+                            m.z,
+                            wnm.data.cast(),
+                            eps,
+                            m.y,
+                            m.y_h,
+                            t_n,
+                            cs,
+                            ld_y,
+                        );
+                    }
                     c.pt.mark(PF_GDN_OUT, cs);
                     c.native_proj(
                         &wo,
@@ -2063,6 +2214,16 @@ unsafe fn run_chunks(
                     let wiqn = host.weight(&f, m.wt, l, "indexer.q_norm.weight")?;
                     let wikn = host.weight(&f, m.wt, l, "indexer.k_norm.weight")?;
                     c.pt.mark(PF_QSA, cs);
+                    let mut q_gpu_cols = wq.ne1;
+                    let npu_q = npu.and_then(|n| {
+                        let mut gc = 0i64;
+                        ((n.qsa_start)(cs, m.gemm, l, &wq, m.mixed_h, t_n, &mut gc) != 0).then(
+                            || {
+                                q_gpu_cols = gc;
+                                n
+                            },
+                        )
+                    });
                     c.native_proj(
                         &wk,
                         m.mixed_h,
@@ -2081,15 +2242,39 @@ unsafe fn run_chunks(
                         0,
                         0,
                     )?;
-                    c.native_proj(
-                        &wq,
-                        m.mixed_h,
-                        m.qf,
-                        t_n,
-                        || wname(l, "attn_q.weight"),
-                        0,
-                        0,
-                    )?;
+                    if npu_q.is_some() {
+                        if q_gpu_cols > 0 {
+                            if wq.native_data.is_null() {
+                                return Err(format!(
+                                    "prefill: {} has no native GGUF blocks",
+                                    wname(l, "attn_q.weight")
+                                ));
+                            }
+                            (f.gemm_native)(
+                                m.gemm,
+                                m.mixed_h,
+                                wq.native_type,
+                                wq.native_data,
+                                m.qf,
+                                t_n,
+                                q_gpu_cols,
+                                wq.ne0,
+                                wq.ne1,
+                                0.0,
+                                0,
+                            );
+                        }
+                    } else {
+                        c.native_proj(
+                            &wq,
+                            m.mixed_h,
+                            m.qf,
+                            t_n,
+                            || wname(l, "attn_q.weight"),
+                            0,
+                            0,
+                        )?;
+                    }
                     c.bf16_proj(
                         &wik,
                         m.mixed_bf,
@@ -2254,6 +2439,11 @@ unsafe fn run_chunks(
                             "reading the prompt (batched, step sync): the K/V append at layer",
                             l,
                         );
+                    }
+                    if let Some(n) = npu_q {
+                        if (n.qsa_finish)(cs, m.qf, t_n) == 0 {
+                            return Err("prefill: NPU QSA q_proj finish failed".into());
+                        }
                     }
                     (f.split_q)(m.qf, m.q, t_n, cs);
                     (f.rms_rows)(m.q, wqn.data.cast(), t_n * qh, hd, hd, eps, cs);
@@ -2533,9 +2723,13 @@ unsafe fn run_chunks(
                         Ok(())
                     };
                     // Only the router needs to finish before readback: the shared expert after it where it can
-                    // overlap the host grouping and the routed-only path's first uploads
-                    let defer_shared = !stream_all && e.stream_ahead;
-                    if !defer_shared {
+                    // overlap the host grouping and the routed-only path's first uploads.
+                    // When NPU is eligible, launch gate_shexp + up_shexp on NPU in parallel with routed experts.
+                    let npu_sh = npu.filter(|n| {
+                        (n.moe_shexp_start)(cs, m.gemm, l, &wsg, &wsu, m.mixed_h, t_n) != 0
+                    });
+                    let defer_shared = npu_sh.is_none() && !stream_all && e.stream_ahead;
+                    if npu_sh.is_none() && !defer_shared {
                         shared_expert(c)?;
                     }
                     let fm = host.fmts[l as usize];
@@ -2664,6 +2858,49 @@ unsafe fn run_chunks(
                                 pending: &mut pending,
                             },
                         )?;
+                    }
+                    if let Some(n) = npu_sh {
+                        if (n.moe_shexp_finish)(cs, m.sh_h, t_n) == 0 {
+                            return Err("prefill: NPU MoE shared expert finish failed".into());
+                        }
+                        c.native_proj(
+                            &wsd,
+                            m.sh_h,
+                            m.shared,
+                            t_n,
+                            || wname(l, "ffn_down_shexp.weight"),
+                            0,
+                            0,
+                        )?;
+                        if wgi.bf16 == 0 {
+                            return Err("prefill: shared gate is not BF16".into());
+                        }
+                        (f.gemm_bf16)(
+                            m.gemm,
+                            m.mixed_bf,
+                            wgi.data.cast(),
+                            m.sg,
+                            t_n,
+                            1,
+                            nn,
+                            0,
+                            0.0,
+                            0,
+                        );
+                        if !m.mixed_bf_lo.is_null() {
+                            (f.gemm_bf16)(
+                                m.gemm,
+                                m.mixed_bf_lo,
+                                wgi.data.cast(),
+                                m.sg,
+                                t_n,
+                                1,
+                                nn,
+                                0,
+                                1.0,
+                                0,
+                            );
+                        }
                     }
                     c.pt.mark(PF_COMBINE, cs);
                     let row_sd = if use_mmq && !fused_l && native && fm.tail_off != 0 {
@@ -2864,6 +3101,9 @@ unsafe fn run_chunks(
         if pending.stager_chunk {
             (f.stager_finish)(pf);
             pending.stager_chunk = false;
+        }
+        if let Some(n) = npu {
+            (n.end_chunk)();
         }
         c0 += m.t;
     }

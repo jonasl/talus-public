@@ -1715,6 +1715,70 @@ __global__ void __launch_bounds__(QTH) gdn_rec_dpp2f_kernel(float* __restrict__ 
 // gdn_out_norm_kernel's body over a grid-stride walk of the (token, head) rows: the old kernel launched a 128-thread
 // block per row (T * 48 blocks; ~45 GB/s on the 8060S).  The same code per row (the same compiled arithmetic: a wave
 // per row with four values per lane rounded differently in its first xor step).
+#if defined(__HIPCC__)
+__device__ __forceinline__ float npu_stream_z_val(const uint8_t* stream, uint32_t tl, uint32_t cc) {
+    constexpr uint32_t kTileRowsC = 512;
+    constexpr uint32_t kTileN = 128;
+    constexpr uint32_t kGroupsPerTile = kTileRowsC * kTileN / 8;
+    constexpr uint32_t kTilesN = 1024 / kTileN;
+    const uint32_t tile_row = tl / kTileRowsC;
+    const uint32_t r = tl % kTileRowsC;
+    const uint32_t tile_col = cc / kTileN;
+    const uint32_t c = cc % kTileN;
+    const uint32_t rib = r & 7;
+    const uint32_t br = (r >> 3) & 1;
+    const uint32_t sr = r >> 4;
+    const uint32_t bc = (c >> 3) & 1;
+    const uint32_t sc = c >> 4;
+    const uint32_t gi = rib | (bc << 3) | (br << 4) | (sc << 5) | (sr << 8);
+    const uint8_t* p = stream + (size_t{tile_row * kTilesN + tile_col} * kGroupsPerTile + gi) * 9;
+    return static_cast<float>(static_cast<int8_t>(p[1 + (c & 7)])) *
+           (ldexpf(1.0f, static_cast<int>(p[0]) - 127) / 64.0f);
+}
+
+template <bool WY>
+__global__ void __launch_bounds__(S) gdn_out_norm_npu_kernel(
+    const float* __restrict__ z, const float* __restrict__ gamma, float eps, float* __restrict__ y,
+    uint16_t* __restrict__ y16, int64_t rows, int64_t ld16,
+    const uint8_t* const* z_streams, uint32_t z_stream_stride, uint32_t z_tokens, uint32_t z_gpu_cols) {
+    __shared__ float wsum[4];
+    const int col = threadIdx.x;
+    for (int64_t row = blockIdx.x; row < rows; row += gridDim.x) {
+        const size_t at = (size_t) row * S + col;
+        const float oc = y[at];
+        float sp = __fmaf_rn(oc, oc, __shfl_xor_sync(0xffffffffu, __fmul_rn(oc, oc), 16));
+#pragma unroll
+        for (int o = 8; o > 0; o >>= 1) sp = __fadd_rn(sp, __shfl_xor_sync(0xffffffffu, sp, o));
+        __syncthreads();
+        if ((col & 31) == 0) wsum[col >> 5] = sp;
+        __syncthreads();
+        const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
+        const int64_t t = row / HV;
+        const uint32_t gcol = static_cast<uint32_t>((row % HV) * S + col);
+        float zv;
+        if (z_streams != nullptr && gcol >= z_gpu_cols) {
+            const uint32_t ncol = gcol - z_gpu_cols;
+            const uint32_t g = static_cast<uint32_t>(t) / z_tokens;
+            const uint32_t tl = static_cast<uint32_t>(t) % z_tokens;
+            zv = npu_stream_z_val(z_streams[g * z_stream_stride + ncol / 1024], tl, ncol % 1024);
+        } else {
+            zv = z[at];
+        }
+        const float bp = oc * rsqrtf(ss / (float) S + eps) * gamma[col], sg = sigm(zv);
+        const size_t o16 = (size_t) t * ld16 + gcol;
+        if constexpr (WY) {
+            const float v = bp * sg;
+            y[at] = v;
+            y16[o16] = hf(v);
+        } else {
+            unsigned r;
+            asm("v_fma_mixlo_f16 %0, %1, %2, 0" : "=v"(r) : "v"(sg), "v"(bp));
+            y16[o16] = (uint16_t) r;
+        }
+    }
+}
+#endif
+
 template <bool WY>
 __global__ void __launch_bounds__(S) gdn_out_norm_loop_kernel(const float* __restrict__ z, const float* __restrict__ gamma,
                                                               float eps, float* __restrict__ y, uint16_t* __restrict__ y16,
@@ -2674,6 +2738,48 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
     static const bool head = [] { const char* v = std::getenv("STRATA_GDN_HEAD"); return v != nullptr && std::atoi(v) != 0; }();
     static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;
     gdn_recurrence_variant(head && !serial ? 1 : 0, state, h, gate, beta, z, gamma, eps, y, y16, T, stream, ld16);
+}
+void gdn_recurrence_npu(float* state, const float* h, const float* gate, const float* beta, const float* z,
+                        const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream,
+                        int64_t ld16, void (*before_epilogue)(void*), void* before_arg,
+                        const uint8_t* const* z_streams, uint32_t z_stream_stride,
+                        uint32_t z_tokens, uint32_t z_gpu_cols) {
+#if defined(__HIPCC__)
+    if (T <= 0) return;
+    if (ld16 <= 0) ld16 = (int64_t) HV * S;
+    static const bool head = [] { const char* v = std::getenv("STRATA_GDN_HEAD"); return v != nullptr && std::atoi(v) != 0; }();
+    static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;
+    if (head && !serial) {
+        static const int pp = [] { const char* v = std::getenv("STRATA_GDN_PP"); return v ? std::atoi(v) : 0; }();
+        if (pp == 3)
+            gdn_rec_dpp2c_kernel<<<HV * (S / C2CB), QTH, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+        else if (pp == 4)
+            gdn_rec_dpp2f_kernel<4><<<HV * (S / C2CB), QTH, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+        else if (pp == 5)
+            gdn_rec_dpp2f_kernel<8><<<HV * (S / C2CB), QTH, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+        else if (pp == 2)
+            gdn_rec_quad2c_kernel<<<HV * (S / C2CB), QTH, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+        else if (pp)
+            gdn_rec_quad_pp_kernel<<<HV * (S / QCB), QTH, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+        else
+            gdn_rec_quad_kernel<<<HV * (S / QCB), QTH, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+    } else {
+        gdn_rec_cols_pipe_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+    }
+    if (before_epilogue) before_epilogue(before_arg);
+    static const bool noy = [] { const char* v = std::getenv("STRATA_GDN_NOY"); return v && std::atoi(v) != 0; }();
+    const unsigned grid = (unsigned) std::min<int64_t>(T * HV, 4096);
+    if (noy)
+        gdn_out_norm_npu_kernel<false><<<grid, S, 0, (cudaStream_t) stream>>>(
+            z, gamma, eps, y, y16, T * HV, ld16, z_streams, z_stream_stride, z_tokens, z_gpu_cols);
+    else
+        gdn_out_norm_npu_kernel<true><<<grid, S, 0, (cudaStream_t) stream>>>(
+            z, gamma, eps, y, y16, T * HV, ld16, z_streams, z_stream_stride, z_tokens, z_gpu_cols);
+    check("gdn_recurrence_npu");
+#else
+    if (before_epilogue) before_epilogue(before_arg);
+    gdn_recurrence(state, h, gate, beta, z, gamma, eps, y, y16, T, stream, ld16);
+#endif
 }
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream) {
     if (n_expert == 512)

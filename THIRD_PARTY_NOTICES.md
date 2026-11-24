@@ -242,10 +242,12 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-## 6. gufo (design idea only)
+## 6. gufo and f-gufo (NPU kernel artifacts & design inspiration)
 
-No code from [gufo](https://github.com/gufo-org/gufo) is in this repository. Two drafting choices in Talus (looking
-for a long prompt match before running a draft head, and letting a prompt match fill a wider verify window on edits;
-see "Long copies" in `docs/MODELS.md`) were prompted by reading gufo's speculative-decoding notes during our benchmark
-comparison. gufo is licensed under the MIT License (`Copyright (c) 2026 Mostafa`).
+Two drafting choices in Talus (looking for a long prompt match before running a draft head, and letting a prompt match fill a wider verify window on edits; see "Long copies" in `docs/MODELS.md`) were prompted by reading [gufo](https://github.com/gufo-org/gufo)'s speculative-decoding notes (`Copyright (c) 2026 Mostafa`, MIT License).
+
+The XDNA2 NPU kernel artifacts and AIE build sources in `tools/npu/` (`final_4096x2560x1024_128x64x128.xclbin`, `insts_4096x2560x1024_128x64x128.txt`, `mm_bfp_mixed.cc`, `n32_core_placed.py`, and `fabric-clock.sh` reference) are from [ZakFong/f-gufo](https://github.com/ZakFong/f-gufo/tree/fork-enhancements/tools/npu):
+
+- `final_4096x2560x1024_128x64x128.xclbin` and `insts_4096x2560x1024_128x64x128.txt` — `MIT` (`Copyright (c) 2026 gufo contributors`).
+- `mm_bfp_mixed.cc` and `n32_core_placed.py` — `Apache-2.0 WITH LLVM-exception` (`Copyright (C) 2026, Advanced Micro Devices, Inc.`, MLIR-AIE).
 

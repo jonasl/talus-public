@@ -38,6 +38,9 @@
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_fused.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
+#ifdef STRATA_USE_HIP
+#include "npu/prefill_npu.hpp"
+#endif
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/tp_moe.hpp"
 #include "strata/core/peer_experts.hpp"
@@ -2411,6 +2414,35 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     std::future<bool> ple_next;             // declared after everything it reads: an early return waits for it
     int ple_buf = 0;
 
+#ifdef STRATA_USE_HIP
+    auto to_npu_w = [](const core::WeightRef* r) {
+        talus::npu::WeightDesc d;
+        if (r) {
+            d.native_data = r->native_data;
+            d.native_type = r->native_type;
+            d.bf16_data = r->data;
+            d.is_bf16 = r->kind == core::WeightKind::Bf16InF32;
+            d.ne0 = r->ne0;
+            d.ne1 = r->ne1;
+        }
+        return d;
+    };
+    talus::npu::PrefillNpu* npu = nullptr;
+    if (talus::npu::PrefillNpu::EnabledInEnv()) {
+        std::string npu_err;
+        npu = talus::npu::PrefillNpu::GetOrCreate(&npu_err);
+        if (npu == nullptr) {
+            const char* req = std::getenv("TALUS_NPU_REQUIRED");
+            if (req && req[0] == '1') {
+                err = "NPU required (TALUS_NPU_REQUIRED=1) but unavailable: " + npu_err;
+                return false;
+            }
+        } else {
+            npu->SetContext(m.wt);
+        }
+    }
+#endif
+
     for (int64_t c0 = 0; c0 < n; c0 += m.T) {
         if (should_stop && should_stop()) { err = "cancelled"; return false; }
         if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "talus trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
@@ -2932,8 +2964,22 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfGdn, cs);
                     float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                    int64_t z_gpu_cols = ZV;
+                    bool npu_z = false;
+#ifdef STRATA_USE_HIP
+                    if (npu != nullptr) {
+                        npu_z = npu->StartGdnZ(m.cs, &m.gemm, l, to_npu_w(wg), m.mixed_h, T, &z_gpu_cols);
+                    }
+#endif
                     if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
-                    if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
+                    if (npu_z) {
+                        if (z_gpu_cols > 0) {
+                            if (!wg->native_data) { err = v.name("attn_gate.weight") + " has no native GGUF blocks"; return false; }
+                            m.gemm.native(m.mixed_h, wg->native_type, wg->native_data, m.z, T, z_gpu_cols, wg->ne0, ZV, 0.0f, 0);
+                        }
+                    } else {
+                        if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
+                    }
                     if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                     if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                     pt.mark(kPfGdnConv, cs);   // "gdn" is the projections in; the rest on their own lines
@@ -2941,6 +2987,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs);
                     pt.mark(kPfGdnRec, cs);
                     const int64_t ld_y = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;
+#ifdef STRATA_USE_HIP
+                    if (npu_z) {
+                        npu->GdnRecurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, m.cs, ld_y);
+                    } else
+#endif
                     gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, m.cs,
                                    ld_y);
                     pt.mark(kPfGdnOut, cs);
@@ -2958,9 +3009,23 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           *wikn = need(v, "indexer.k_norm.weight", err);
                     if (!wq || !wk || !wv || !wo || !wik || !wiq || !wqn || !wkn || !wiqn || !wikn) return false;
                     pt.mark(kPfQsa, cs);
+                    int64_t q_gpu_cols = wq->ne1;
+                    bool npu_q = false;
+#ifdef STRATA_USE_HIP
+                    if (npu != nullptr) {
+                        npu_q = npu->StartQsaQ(m.cs, &m.gemm, l, to_npu_w(wq), m.mixed_h, T, &q_gpu_cols);
+                    }
+#endif
                     if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
                     if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err)) return false;
-                    if (!native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
+                    if (npu_q) {
+                        if (q_gpu_cols > 0) {
+                            if (!wq->native_data) { err = v.name("attn_q.weight") + " has no native GGUF blocks"; return false; }
+                            m.gemm.native(m.mixed_h, wq->native_type, wq->native_data, m.Qf, T, q_gpu_cols, wq->ne0, wq->ne1, 0.0f, 0);
+                        }
+                    } else {
+                        if (!native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
+                    }
                     if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                     if (!bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                     rms_rows(m.Kc, (const float*) wkn->data, T * QKV, HD, HD, EPS, m.cs);
@@ -3025,6 +3090,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                 (p0 + T + s.page_size - 1) / s.page_size, s, m.cs);
                     }
                     if (staged) pf_step("reading the prompt (batched, step sync): the K/V append at layer", l);
+#ifdef STRATA_USE_HIP
+                    if (npu_q && !npu->FinishQsaQ(m.cs, m.Qf, T)) {
+                        err = "prefill: NPU QSA q_proj finish failed";
+                        return false;
+                    }
+#endif
                     split_q(m.Qf, m.q, T, m.cs);
                     rms_rows(m.q, (const float*) wqn->data, T * QH, HD, HD, EPS, m.cs);
                     rope(m.q, T, QH, HD, QH * HD, p0, strata::kernels::rope_scaling(), m.cs);
@@ -3269,8 +3340,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     };
                     // Only the router needs to finish before readback. Queue the shared expert afterwards
                     // so it can overlap CPU grouping and the routed-only path's initial expert uploads.
-                    const bool defer_shared = !stream_all && stream_ahead_enabled();
-                    if (!defer_shared && !shared_expert()) return false;
+                    bool npu_sh = false;
+#ifdef STRATA_USE_HIP
+                    if (npu != nullptr) {
+                        npu_sh = npu->StartMoeShexp(m.cs, &m.gemm, l, to_npu_w(wsg), to_npu_w(wsu), m.mixed_h, T);
+                    }
+#endif
+                    const bool defer_shared = !npu_sh && !stream_all && stream_ahead_enabled();
+                    if (!npu_sh && !defer_shared && !shared_expert()) return false;
                     // #136: STRATA_PF_FUSED=1 - the Q2_0 pack's experts on the fused int8 kernels (moe_fused.hpp),
                     // grouped on the GPU: no host sync.  Only where every expert's place is known before the routing -
                     // the streamed walk, in which every non-resident expert of the layer comes through the ring in id
@@ -4266,6 +4343,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             release_to(m.g->n_expert);
                         }
                     }
+#ifdef STRATA_USE_HIP
+                    if (npu_sh) {
+                        if (!npu->FinishMoeShexp(m.cs, m.sh_h, T)) {
+                            err = "prefill: NPU MoE shared expert finish failed";
+                            return false;
+                        }
+                        if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
+                        if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
+                        m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
+                        if (m.mixed_bf_lo) m.gemm.bf16(m.mixed_bf_lo, (const uint16_t*) wgi->data, m.sg, T, 1, N, 0, 1.0f);
+                    }
+#endif
                     pt.mark(kPfCombine, cs);
                     if (cpu_fut.valid()) {   // set_cpu_pool: the CPU's rows into Dm's tail, row_sd 1 (s_down is in them)
                         if (cpu_share_env() < 0.0) cudaEventRecord(m.cpu_ev[1], m.cs);   // after the GPU's expert work
@@ -4411,6 +4500,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             stats_.experts_dma += iss_dma;
         }
         stats_.tokens += T;
+#ifdef STRATA_USE_HIP
+        if (npu != nullptr) npu->EndChunk();
+#endif
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
         pt.mark(kPfStart, cs);
         if (next_ != nullptr) {

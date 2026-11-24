@@ -84,6 +84,14 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
 void gdn_recurrence_variant(int variant, float* state, const float* h, const float* gate, const float* beta,
                             const float* z, const float* gamma, float eps, float* y, uint16_t* y16, int64_t T,
                             void* stream, int64_t ld16 = 0);
+/// GDN recurrence with NPU z-stream epilogue: runs the recurrence on GPU while NPU finishes `z`, invokes
+/// `before_epilogue(before_arg)` (e.g. `talus_npu_wait`), then runs the output norm reading columns
+/// `[z_gpu_cols, 6144)` directly from `z_streams` (each entry is a `z_tokens x 1024` C tile stream).
+void gdn_recurrence_npu(float* state, const float* h, const float* gate, const float* beta, const float* z,
+                        const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream,
+                        int64_t ld16, void (*before_epilogue)(void*), void* before_arg,
+                        const uint8_t* const* z_streams, uint32_t z_stream_stride,
+                        uint32_t z_tokens, uint32_t z_gpu_cols);
 
 // ---- MoE
 /// softmax over 512, top-10 (ties to the lower id), weights renormalised over the ten (the native router).

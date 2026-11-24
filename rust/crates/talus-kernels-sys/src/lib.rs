@@ -5087,6 +5087,16 @@ impl LibTalusKernels {
         }
     }
 
+    /// Resolve an optional symbol from the loaded `libtalus_kernels` handle.
+    ///
+    /// # Safety
+    ///
+    /// `T` must match the exact C ABI signature and calling convention of `name`.
+    #[cfg(unix)]
+    pub unsafe fn resolve_symbol<T>(&self, name: &'static str) -> Result<T, String> {
+        load_sym(self.handle, name)
+    }
+
     /// Dynamically load `libtalus_kernels.so` from `path` using `dlopen`/`dlsym` and resolve all
     /// Contract v0 entry points.
     #[cfg(unix)]

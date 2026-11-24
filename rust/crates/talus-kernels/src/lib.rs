@@ -6,6 +6,7 @@ pub mod cpu_mock;
 pub mod ffi;
 pub mod kernel_set;
 pub mod knobs;
+pub mod npu;
 pub mod plans;
 pub mod quant;
 pub mod tune;

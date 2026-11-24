@@ -1,6 +1,7 @@
 //! Engine trait, `EngineTimings`, `ScriptedMockEngine`, and `StdioSubprocessEngine`
 //! implementing the Strata/Talus stdio engine protocol (`READY`, `GEN`, `PP`, `RESUME`, `T`, `DONE`, `STOP`, `QUIT`).
 
+use crate::batch::{BatchClient, Leg, StdinSink};
 use crate::json::JsonValue;
 use crate::tokenizer::{ByteTokenizer, ID_IM_END};
 use std::collections::HashMap;
@@ -1374,7 +1375,11 @@ impl Engine for ScriptedMockEngine {
         on_progress: &mut dyn FnMut(usize, usize),
     ) -> Result<EngineTimings, EngineError> {
         if let Some(b) = self.batch.lock().unwrap().clone() {
-            return self.generate_via_batch(b, req, &cancel, on_token, on_progress);
+            // The same eligibility the stdio engine applies: `L` lines carry no slot number,
+            // so a request that wants logprobs stays on the control lines.
+            if req.sampling.logprobs.is_none() {
+                return self.generate_via_batch(b, req, &cancel, on_token, on_progress);
+            }
         }
         let lp_k = req
             .sampling
@@ -2141,9 +2146,9 @@ pub(crate) const STDIN_WRITE_FAILED: &str = "engine stdin write failed";
 /// Flash-Next, whose 91 threads take a moment to go). The client has seen nothing of this request, so it is sent once more.
 /// A prompt that itself crashes the engine this fast must not reach the cap sooner for it: a death on the resend costs no
 /// entry in the restart window (`free_restart`). An exit later than `RESEND_WINDOW` is an ordinary crash, with no resend.
-const ENDED_BEFORE_ANSWERING: &str = "the engine process ended before answering";
+pub(crate) const ENDED_BEFORE_ANSWERING: &str = "the engine process ended before answering";
 
-const RESEND_WINDOW: Duration = Duration::from_secs(2);
+pub(crate) const RESEND_WINDOW: Duration = Duration::from_secs(2);
 
 fn never_reached_engine(err: Option<&EngineError>) -> bool {
     matches!(err, Some(EngineError::EngineDied(m))
@@ -2684,15 +2689,10 @@ impl StdioSubprocessEngine {
         }
     }
 
-    fn generate_on(
-        &self,
-        handle: &mut SubprocessHandle,
-        req: &GenerateRequest,
-        cancel: Arc<AtomicBool>,
-        on_token: &mut dyn FnMut(u32, Option<TokenLogprob>) -> bool,
-        on_progress: &mut dyn FnMut(usize, usize),
-    ) -> Result<EngineTimings, EngineError> {
-        let keys = req.sampling.to_gen_keys();
+    /// The body a `GEN` or `BGEN` carries: the sampling keys, the native tower's framing keys
+    /// and `@raw` frame, and the prompt's comma list. The engine rewrites a `BGEN` into a `GEN`
+    /// with this body untouched, so both requests build it the same way.
+    fn gen_body(&self, req: &GenerateRequest) -> (String, Option<Arc<Vec<u8>>>, String) {
         let csv_ids: String = req
             .prompt_ids
             .iter()
@@ -2702,9 +2702,9 @@ impl StdioSubprocessEngine {
         // pictures: GENI's embeddings file is the first space-split token without an `=`, so it
         // goes after the sampling keys and before the ids (serve/server.py's head construction).
         // The native `@raw` form: the per-picture byte lengths frame the frame behind the line,
-        // and the server's size predictions ride for the tower to check — both keys before the
+        // and the server's size predictions ride for the tower to check - both keys before the
         // emb-path token, which is the engine's own line order.
-        let mut keys = keys;
+        let mut keys = req.sampling.to_gen_keys();
         let mut frame = None;
         if let (Some(f), true) = (&req.raw_frame, req.embeddings.as_deref() == Some("@raw")) {
             keys += &format!(
@@ -2720,6 +2720,18 @@ impl StdioSubprocessEngine {
             }
             frame = Some(f.clone());
         }
+        (keys, frame, csv_ids)
+    }
+
+    fn generate_on(
+        &self,
+        handle: &mut SubprocessHandle,
+        req: &GenerateRequest,
+        cancel: Arc<AtomicBool>,
+        on_token: &mut dyn FnMut(u32, Option<TokenLogprob>) -> bool,
+        on_progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<EngineTimings, EngineError> {
+        let (keys, frame, csv_ids) = self.gen_body(req);
         let cmd = match &req.embeddings {
             Some(path) => match &req.img_keys {
                 Some(k) => format!(
@@ -2856,6 +2868,120 @@ impl StdioSubprocessEngine {
                 return Err(EngineError::InvalidRequest(rest.trim().to_string()));
             }
         }
+    }
+
+    /// Whether a request can run on a batch slot: the engine has slots, and its features ride
+    /// the slot wires. `L` (logprob) lines carry no slot number, so a request that wants them
+    /// keeps the control lines to itself - the solo path, correct beside decoding slots because
+    /// it holds `proc` for its whole exchange, which blocks every admission behind it.
+    fn slot_eligible(&self, req: &GenerateRequest) -> bool {
+        self.batch_slots() > 0 && req.sampling.logprobs.is_none()
+    }
+
+    /// The handshake of one slot leg: claim a slot, drain, `BGEN`/`BGENI`, read the answer on
+    /// the control lines. The caller holds `proc` across it - the handshake IS the engine's
+    /// control-line handoff - and by the time this returns the lines are free again, the slot
+    /// (if it continued) decoding on its own.
+    fn admit_slot(
+        &self,
+        bus: &Arc<EngineBus>,
+        sink: &StdinSink,
+        req: &GenerateRequest,
+        cancel: &Arc<AtomicBool>,
+        on_token: &mut dyn FnMut(u32, Option<TokenLogprob>) -> bool,
+        on_progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<Leg, EngineError> {
+        let (keys, frame, csv) = self.gen_body(req);
+        let cmd = |slot: usize| match (&req.embeddings, &req.img_keys) {
+            (Some(path), Some(k)) => format!(
+                "BGENI {slot} {}{keys} img_keys={k} {path} {csv}",
+                req.max_new_tokens
+            ),
+            (Some(path), None) => {
+                format!("BGENI {slot} {}{keys} {path} {csv}", req.max_new_tokens)
+            }
+            _ => format!("BGEN {slot} {}{keys} {csv}", req.max_new_tokens),
+        };
+        let client = BatchClient { bus, sink };
+        let is_stop = |t: u32| self.tok.is_stop_token(t) || req.stop_tokens.contains(&t);
+        client.admit(
+            &cmd,
+            frame.as_deref().map(|v| v.as_slice()),
+            &req.prompt_ids,
+            cancel,
+            &mut |t, lp| {
+                if is_stop(t) && !req.sampling.ignore_eos {
+                    false // the solo path suppresses the stop token too, and never yields it
+                } else {
+                    on_token(t, lp)
+                }
+            },
+            on_progress,
+        )
+    }
+
+    /// Read the slot's leg to its `BDONE` and assemble the figures. The pump holds neither
+    /// `proc` nor the control lines: the next request admits while this one streams.
+    fn pump_slot(
+        &self,
+        bus: &Arc<EngineBus>,
+        sink: &StdinSink,
+        leg: Leg,
+        req: &GenerateRequest,
+        cancel: &Arc<AtomicBool>,
+        on_token: &mut dyn FnMut(u32, Option<TokenLogprob>) -> bool,
+    ) -> Result<EngineTimings, EngineError> {
+        let client = BatchClient { bus, sink };
+        let emitted: Vec<u32> = leg.admission.into_iter().collect();
+        let is_stop = |t: u32| self.tok.is_stop_token(t) || req.stop_tokens.contains(&t);
+        let res = client.pump(leg.slot, &req.prompt_ids, &emitted, cancel, &mut |t| {
+            if is_stop(t) && !req.sampling.ignore_eos {
+                false
+            } else {
+                on_token(t, None)
+            }
+        })?;
+        self.slot_timings(&leg, res.produced, res.decode_ms, &res.finish, cancel)
+    }
+
+    /// A slot leg's figures in the solo path's `EngineTimings` shape: the admission's `DONE`
+    /// carries the prompt side (and its own decode time), the `BDONE` the rest. The engine's
+    /// `produced` counts the stop token as the solo `DONE` does, and `BDONE` carries no draft
+    /// counters, so a slot leg reports none.
+    fn slot_timings(
+        &self,
+        leg: &Leg,
+        produced: usize,
+        decode_ms: f64,
+        finish: &str,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<EngineTimings, EngineError> {
+        if finish == "nonfinite" {
+            return Err(EngineError::NonFinite(
+                "the engine encountered non-finite logits".to_string(),
+            ));
+        }
+        let cache_n = leg.done_reused.unwrap_or(leg.reused).min(leg.prompt_n);
+        Ok(EngineTimings {
+            cache_n,
+            prompt_n: leg.prompt_n.saturating_sub(cache_n),
+            prompt_ms: leg.prompt_ms,
+            predicted_n: produced,
+            predicted_ms: leg.predicted_ms + decode_ms,
+            draft_n: None,
+            draft_accepted: None,
+            finish_reason: if finish == "cancel" || finish == "abort" {
+                // The solo distinction: a request the client left reports `cancel`; one that
+                // ended on its stop token reports `stop`.
+                if cancel.load(Ordering::Relaxed) {
+                    "cancel".to_string()
+                } else {
+                    "stop".to_string()
+                }
+            } else {
+                finish.to_string()
+            },
+        })
     }
 
     /// The resend's outcome: if the engine died again, that death costs no entry in the restart window.
@@ -3048,13 +3174,68 @@ impl Engine for StdioSubprocessEngine {
         let mut slot = self.proc.lock().unwrap();
         self.busy.fetch_add(1, Ordering::SeqCst);
         let _busy = BusyGuard(&self.busy);
-        let handle = self.running(&mut slot)?;
-        let mut res = self.generate_on(handle, req, cancel.clone(), on_token, on_progress);
-        self.settle_after_error(&mut slot, res.as_ref().err());
-        if never_reached_engine(res.as_ref().err()) {
+        if !self.slot_eligible(req) {
             let handle = self.running(&mut slot)?;
-            res = self.generate_on(handle, req, cancel, on_token, on_progress);
+            let mut res = self.generate_on(handle, req, cancel.clone(), on_token, on_progress);
+            self.settle_after_error(&mut slot, res.as_ref().err());
+            if never_reached_engine(res.as_ref().err()) {
+                let handle = self.running(&mut slot)?;
+                res = self.generate_on(handle, req, cancel, on_token, on_progress);
+                self.after_resend(&mut slot, res.as_ref().err());
+            }
+            return res;
+        }
+        // The handshake runs with `proc` held (the control lines are the engine's handoff); the
+        // pump then runs without it, which is the whole point of the slot: the next request
+        // admits while this one decodes.
+        let mut bus;
+        let mut sink;
+        {
+            let handle = self.running(&mut slot)?;
+            bus = handle.bus.clone();
+            sink = StdinSink(handle.stdin.clone());
+        }
+        let mut res = self.admit_slot(&bus, &sink, req, &cancel, on_token, on_progress);
+        if never_reached_engine(res.as_ref().err()) {
+            self.settle_after_error(&mut slot, res.as_ref().err());
+            let handle = self.running(&mut slot)?;
+            bus = handle.bus.clone();
+            sink = StdinSink(handle.stdin.clone());
+            res = self.admit_slot(&bus, &sink, req, &cancel, on_token, on_progress);
             self.after_resend(&mut slot, res.as_ref().err());
+        }
+        let leg = match res {
+            Ok(leg) => leg,
+            Err(e) => {
+                self.settle_after_error(&mut slot, Some(&e));
+                return Err(e);
+            }
+        };
+        if leg.cancelled {
+            let produced = leg.admission.into_iter().count();
+            return self.slot_timings(
+                &leg,
+                produced,
+                0.0,
+                if cancel.load(Ordering::Relaxed) {
+                    "cancel"
+                } else {
+                    "stop"
+                },
+                &cancel,
+            );
+        }
+        if !leg.cont {
+            let produced = leg.admission.into_iter().count();
+            let finish = leg.finish.clone();
+            return self.slot_timings(&leg, produced, 0.0, &finish, &cancel);
+        }
+        // Let the engine go: the pump reads only the slot's routed lines.
+        drop(slot);
+        let res = self.pump_slot(&bus, &sink, leg, req, &cancel, on_token);
+        if matches!(res.as_ref().err(), Some(EngineError::EngineDied(_))) {
+            let mut slot = self.proc.lock().unwrap();
+            self.settle_after_error(&mut slot, res.as_ref().err());
         }
         res
     }

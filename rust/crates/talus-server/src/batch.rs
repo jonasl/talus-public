@@ -15,7 +15,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::engine::{
-    BusLine, EngineBus, EngineError, EngineStdin, TokenLogprob, STDIN_WRITE_FAILED,
+    BusLine, EngineBus, EngineError, EngineStdin, TokenLogprob, ENDED_BEFORE_ANSWERING,
+    RESEND_WINDOW, STDIN_WRITE_FAILED,
 };
 
 /// Something engine commands can be written to: the real engine's stdin, or a mock's script
@@ -68,6 +69,11 @@ pub(crate) struct Leg {
     pub(crate) reused: usize,
     pub(crate) prompt_n: usize,
     pub(crate) prompt_ms: f64,
+    pub(crate) predicted_ms: f64,
+    /// The `DONE` line's own reuse count (its eighth field), which the engine's conversation
+    /// cache reports for the leg; `None` on an engine that does not send it, where `reused`
+    /// (the `RESUME` line) is the figure - the same fallback the solo path applies.
+    pub(crate) done_reused: Option<usize>,
     /// The finish word of the admission's `DONE` line (`stop`/`length`/`cancel`/`nonfinite`/empty).
     pub(crate) finish: String,
     /// The request was cancelled before its admission ended: the `STOP` went out, and a slot
@@ -130,6 +136,8 @@ impl<'a> BatchClient<'a> {
             self.bus.drain_slot(slot);
             let line = cmd(slot);
             self.sink.send(&line, frame)?;
+            let written_at = Instant::now();
+            let mut answered = false;
             let mut leg = Leg {
                 slot,
                 ..Default::default()
@@ -145,9 +153,19 @@ impl<'a> BatchClient<'a> {
                             stop_sent = true;
                         }
                     }
-                    BusLine::Ended => return Err(engine_gone()),
+                    BusLine::Ended => {
+                        // The solo path's rule, kept: a death right behind the write means the
+                        // engine never saw the request, and the caller sends it once more.
+                        let resend = !answered && written_at.elapsed() <= RESEND_WINDOW;
+                        return Err(EngineError::EngineDied(if resend {
+                            ENDED_BEFORE_ANSWERING.to_string()
+                        } else {
+                            "the engine process ended unexpectedly".to_string()
+                        }));
+                    }
                     BusLine::Line(raw) => {
                         let trimmed = raw.trim();
+                        answered = true;
                         if let Some(rest) = trimmed.strip_prefix("T ") {
                             if let Ok(tok) = rest.trim().parse::<u32>() {
                                 let lp = pending_lp.take();
@@ -175,7 +193,10 @@ impl<'a> BatchClient<'a> {
                                 f.get(1).and_then(|x| x.parse::<usize>().ok()).unwrap_or(0);
                             leg.prompt_ms =
                                 f.get(2).and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0);
+                            leg.predicted_ms =
+                                f.get(3).and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0);
                             leg.finish = f.get(4).unwrap_or(&"").to_string();
+                            leg.done_reused = f.get(7).and_then(|x| x.parse::<usize>().ok());
                         } else if let Some(rest) = trimmed.strip_prefix("BADM ") {
                             let f: Vec<&str> = rest.split_whitespace().collect();
                             leg.cont = f.get(1).is_some_and(|x| *x == "1");
@@ -409,10 +430,14 @@ mod tests {
     }
 
     fn run(m: &ScriptedMockEngine, max_new: usize) -> (Vec<u32>, EngineTimings) {
+        run_req(m, request(max_new))
+    }
+
+    fn run_req(m: &ScriptedMockEngine, req: GenerateRequest) -> (Vec<u32>, EngineTimings) {
         let mut toks = Vec::new();
         let timings = m
             .generate(
-                &request(max_new),
+                &req,
                 Arc::new(AtomicBool::new(false)),
                 &mut |t| {
                     toks.push(t);
@@ -533,6 +558,19 @@ mod tests {
         feeder.push("BDONE 0 3 nonfinite 1.0");
         assert!(bus.slot_held(0).is_empty()); // their #879: the slot's state is gone
         assert_eq!(bus.claim_free_slot(), Some(0));
+    }
+
+    #[test]
+    fn logprobs_requests_stay_off_the_slots() {
+        // The mock gates like the stdio engine: `L` lines carry no slot number, so a request
+        // that wants them never admits - and a batch script left waiting proves no slot ran.
+        let m = mock(2);
+        m.set_batch_scripts(vec![vec![10, 11, ID_IM_END]]);
+        let mut req = request(8);
+        req.sampling.logprobs = Some(3);
+        let (toks, _) = run_req(&m, req);
+        assert!(!toks.is_empty(), "the solo mock path answered it");
+        assert!(held(&m, 0).is_empty() && held(&m, 1).is_empty());
     }
 
     #[test]

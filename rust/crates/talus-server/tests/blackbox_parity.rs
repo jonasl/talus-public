@@ -494,6 +494,9 @@ for line in sys.stdin:
         stop_strings: vec![],
         embeddings: None,
         img_keys: None,
+        raw_frame: None,
+        lens: Vec::new(),
+        img_px: None,
     };
     let cancel = Arc::new(AtomicBool::new(false));
     let mut streamed = Vec::new();

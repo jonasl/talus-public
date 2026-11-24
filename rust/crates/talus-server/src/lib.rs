@@ -4,6 +4,8 @@ pub use talus_core_api as api;
 
 pub mod code_span;
 pub mod config;
+#[cfg(test)]
+mod config_native_tests;
 pub mod control;
 pub mod energy;
 pub mod engine;

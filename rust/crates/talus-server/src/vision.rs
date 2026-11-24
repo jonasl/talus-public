@@ -256,10 +256,15 @@ pub fn sniff(bytes: &[u8]) -> Result<&'static str, String> {
 /// The run config's `"vision"` block: the encoder subprocess and its cache.
 #[derive(Clone, Debug)]
 pub struct VisionConfig {
-    /// the `strata-vision` (or `strata-vision-hip`) binary
+    /// the `strata-vision` (or `strata-vision-hip`) binary; unused (and omissible) with `native`
     pub exe: PathBuf,
     /// the model's mmproj file: vision tower + projector, its `out_dim` must equal the model's `n_embd`
     pub mmproj: PathBuf,
+    /// "native": true - the vision tower runs inside the engine (the `tk_vision_*` group in
+    /// libtalus_kernels.so), fed as the GENI `@raw` form: no encoder subprocess, no embeddings
+    /// files.  The config's mmproj names the tower's weights for the engine (its environment),
+    /// and pictures travel with each request's line instead.
+    pub native: bool,
     /// accepted by the CLI and ignored (our tower never tokenizes the text model) — kept so
     /// `server.py` run configs transfer unchanged
     pub model: Option<PathBuf>,
@@ -287,6 +292,7 @@ impl Default for VisionConfig {
         Self {
             exe: PathBuf::new(),
             mmproj: PathBuf::new(),
+            native: false,
             model: None,
             gpu: false,
             threads: None,
@@ -317,8 +323,16 @@ impl VisionConfig {
                     format!("vision: \"{k}\" is required (path to the encoder binary / mmproj)")
                 })
         };
-        c.exe = req("exe")?;
+        c.exe = if v.get_bool("native") == Some(true) {
+            v.get_str("exe")
+                .filter(|s| !s.trim().is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_default()
+        } else {
+            req("exe")?
+        };
         c.mmproj = req("mmproj")?;
+        c.native = v.get_bool("native") == Some(true);
         c.model = v
             .get_str("model")
             .filter(|s| !s.trim().is_empty())
@@ -357,7 +371,97 @@ impl VisionConfig {
     }
 }
 
-// ---------------------------------------------------------------- encoder subprocess
+// ---------------------------------------------------------------- native tower geometry
+
+/// The tower's target size for a `width x height` picture (HF's smart_resize, as mtmd and
+/// src/vision/image_prep.cpp do it): sides rounded to `align`, then bounded by the pixel limits
+/// (0 = no bound).  A native-mode server counts image tokens before the request goes out, and the
+/// engine checks the answer against what its tower actually prepared.  The arithmetic is f32
+/// throughout, term for term like image_prep.cpp: rounding is exactly where a double-precision
+/// port would disagree.
+pub fn smart_resize(
+    width: i64,
+    height: i64,
+    align: i64,
+    min_pixels: i64,
+    max_pixels: i64,
+) -> (i64, i64) {
+    let round_by_factor = |x: f32| ((x / align as f32).round()) as i64 * align;
+    let ceil_by_factor = |x: f32| (x / align as f32).ceil() as i64 * align;
+    let floor_by_factor = |x: f32| (x / align as f32).floor() as i64 * align;
+    if width <= 0 || height <= 0 || align <= 0 {
+        return (0, 0);
+    }
+    let (w, h) = (width as i32, height as i32); // image_prep.cpp computes in C int; same width here
+    let mut w_bar = align.max(round_by_factor(w as f32));
+    let mut h_bar = align.max(round_by_factor(h as f32));
+    if max_pixels > 0 && h_bar * w_bar > max_pixels {
+        let beta = ((h as f32 * w as f32) / max_pixels as f32).sqrt();
+        h_bar = align.max(floor_by_factor(h as f32 / beta));
+        w_bar = align.max(floor_by_factor(w as f32 / beta));
+    } else if min_pixels > 0 && h_bar * w_bar < min_pixels {
+        let beta = (min_pixels as f32 / (h as f32 * w as f32)).sqrt();
+        h_bar = ceil_by_factor(h as f32 * beta);
+        w_bar = ceil_by_factor(w as f32 * beta);
+    }
+    (w_bar, h_bar)
+}
+
+/// The picture's pixel size from its header - `sniff`'s four formats are the four readable
+/// without a decoder; anything else never reaches here.
+pub fn image_size(data: &[u8]) -> Result<(i64, i64), String> {
+    let h = data;
+    if h.len() >= 24 && h[..8] == *b"\x89PNG\r\n\x1a\n" {
+        return Ok((be_u32(&h[16..20]) as i64, be_u32(&h[20..24]) as i64)); // IHDR
+    }
+    if h.len() >= 26 && h[..2] == *b"BM" {
+        let (w, hh) = (le_i32(&h[18..22]), le_i32(&h[22..26])); // DIB: negative height = top-down
+        return Ok((w as i64, hh.unsigned_abs() as i64));
+    }
+    if h.len() >= 10 && (h[..6] == *b"GIF87a" || h[..6] == *b"GIF89a") {
+        return Ok((le_u16(&h[6..8]) as i64, le_u16(&h[8..10]) as i64));
+    }
+    if h.len() > 4 && h[..3] == [0xff, 0xd8, 0xff] {
+        // JPEG: walk the markers to a start-of-frame one (0xC0..0xCF, minus DHT/DAC/JPG)
+        let mut i = 2usize;
+        while i + 9 <= h.len() {
+            if h[i] != 0xff {
+                i += 1; // padding between markers
+                continue;
+            }
+            let m = h[i + 1];
+            if (0xc0..=0xcf).contains(&m) && !matches!(m, 0xc4 | 0xc8 | 0xcc) {
+                return Ok((
+                    be_u16(&h[i + 7..i + 9]) as i64,
+                    be_u16(&h[i + 5..i + 7]) as i64,
+                ));
+            }
+            if m == 0xd8 || m == 0x01 || (0xd0..=0xd9).contains(&m) {
+                i += 2; // markers without a length
+                continue;
+            }
+            i += 2 + be_u16(&h[i + 2..i + 4]) as usize; // skip this segment
+        }
+        return Err("the JPEG has no start-of-frame marker".to_string());
+    }
+    Err("could not read the picture's size (not a PNG, JPEG, BMP or GIF?)".to_string())
+}
+
+fn be_u16(b: &[u8]) -> u16 {
+    u16::from_be_bytes([b[0], b[1]])
+}
+
+fn be_u32(b: &[u8]) -> u32 {
+    u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+}
+
+fn le_u16(b: &[u8]) -> u16 {
+    u16::from_le_bytes([b[0], b[1]])
+}
+
+fn le_i32(b: &[u8]) -> i32 {
+    i32::from_le_bytes([b[0], b[1], b[2], b[3]])
+}
 
 struct EncoderProc {
     child: Child,
@@ -463,12 +567,20 @@ pub struct Cached {
 }
 
 /// What a frontend needs to drive one GENI line: the engine's embeddings file, the `img_keys=`
-/// value, and per-picture grids (for splicing exactly `n` image-pad tokens per picture).
+/// value, and per-picture grids (for splicing exactly `n` image-pad tokens per picture).  The
+/// native tower's variant carries the request's `@raw` frame (the pictures' bytes) and the size
+/// predictions instead of a file; `combine` then holds the `@raw` marker.
 #[derive(Debug)]
 pub struct GeniPayload {
     pub combine: PathBuf,
     pub img_keys: String,
     pub pictures: Vec<Cached>,
+    /// native mode: the encoded pictures, one after another, in prompt order
+    pub raw_frame: Option<Vec<u8>>,
+    /// native mode: the per-picture byte lengths of `raw_frame` (`img_bytes=`)
+    pub lens: Vec<u64>,
+    /// native mode: the predicted `w x h` list (`img_px=`), for the engine's drift check
+    pub px: Option<String>,
 }
 
 enum EncErr {
@@ -485,6 +597,9 @@ struct State {
     order: VecDeque<String>,
     /// the encoder's SVE width (`READY <out_dim>`), known after the first spawn
     out_dim: Option<i64>,
+    /// native mode: the engine tower's geometry constants (align, min_tokens, max_tokens), from
+    /// its `VGEOM` answer; the server's resize predictor needs them before the first picture
+    geom: Option<(i64, i64, i64)>,
 }
 
 impl State {
@@ -499,7 +614,9 @@ impl State {
                 break;
             };
             if let Some(c) = self.cache.remove(&old) {
-                let _ = std::fs::remove_file(c.path);
+                if !c.path.as_os_str().is_empty() {
+                    let _ = std::fs::remove_file(c.path);
+                }
             }
         }
     }
@@ -536,6 +653,7 @@ impl VisionEncoder {
                 cache: HashMap::new(),
                 order: VecDeque::new(),
                 out_dim: None,
+                geom: None,
             }),
         })
     }
@@ -558,12 +676,22 @@ impl VisionEncoder {
     }
 
     /// Encode a whole request's pictures (in prompt order) and build its combine file under one
-    /// lock, so no eviction can delete a part between encoding and concatenation.
-    pub fn encode_request(&self, images: &[Vec<u8>]) -> Result<GeniPayload, String> {
+    /// lock, so no eviction can delete a part between encoding and concatenation.  Native mode
+    /// (the tower in the engine): no encoder, no files - the pictures become the request's `@raw`
+    /// frame, and `geom` is the engine tower's geometry (align, min_tokens, max_tokens) for this
+    /// server's resize predictor, asked for once through `geom_of` and kept.
+    pub fn encode_request(
+        &self,
+        images: &[Vec<u8>],
+        geom_of: impl FnOnce() -> Result<(i64, i64, i64), String>,
+    ) -> Result<GeniPayload, String> {
         if images.is_empty() {
             return Err("vision: a picture request with no pictures".to_string());
         }
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.cfg.native {
+            return self.encode_native(&mut st, images, geom_of);
+        }
         let mut pictures = Vec::with_capacity(images.len());
         for bytes in images {
             pictures.push(self.encode_locked(&mut st, bytes)?);
@@ -577,6 +705,76 @@ impl VisionEncoder {
                 .join(","),
             combine,
             pictures,
+            raw_frame: None,
+            lens: Vec::new(),
+            px: None,
+        })
+    }
+
+    /// The native tower's picture path: normalize (the child encoder's format rules apply
+    /// unchanged - `sniff`ed upstream), predict the tower's resize for the token count, and hand
+    /// back the request's `@raw` frame.  The tower re-encodes every picture each request (an
+    /// encode is ~40 ms, cheaper than caching its rows across requests), so only the geometry -
+    /// the picture's grid - is cached here.
+    fn encode_native(
+        &self,
+        st: &mut State,
+        images: &[Vec<u8>],
+        geom_of: impl FnOnce() -> Result<(i64, i64, i64), String>,
+    ) -> Result<GeniPayload, String> {
+        if st.geom.is_none() {
+            st.geom = Some(geom_of()?);
+        }
+        let (align, min_t, max_t) = st.geom.unwrap();
+        // the vision section's min_tokens/max_tokens override the tower's, as --min-tokens/
+        // --max-tokens do for the child encoder
+        let min_t = self.cfg.min_image_tokens.map(|n| n as i64).unwrap_or(min_t);
+        let max_t = self.cfg.max_image_tokens.map(|n| n as i64).unwrap_or(max_t);
+        let mut pictures = Vec::with_capacity(images.len());
+        let mut frame = Vec::new();
+        let mut lens = Vec::with_capacity(images.len());
+        let mut px = Vec::with_capacity(images.len());
+        for bytes in images {
+            let key = picture_key(bytes);
+            if !st.cache.contains_key(&key) {
+                let (w, h) = image_size(bytes)?;
+                let (pw, ph) =
+                    smart_resize(w, h, align, min_t * align * align, max_t * align * align);
+                let n = (pw / align) * (ph / align);
+                st.cache.insert(
+                    key.clone(),
+                    Cached {
+                        key: key.clone(),
+                        path: PathBuf::new(),
+                        n,
+                        nx: pw / align,
+                        ny: ph / align,
+                    },
+                );
+            }
+            st.touch(&key);
+            let c = &st.cache[&key];
+            // (n, nx, ny) is the grid; the frame carries the encoded bytes, so no rows travel
+            pictures.push(Cached {
+                path: PathBuf::new(),
+                ..c.clone()
+            });
+            px.push(format!("{}x{}", c.nx * align, c.ny * align));
+            frame.extend_from_slice(bytes);
+            lens.push(bytes.len() as u64);
+            st.evict(self.cfg.cache_entries);
+        }
+        Ok(GeniPayload {
+            combine: PathBuf::from("@raw"),
+            img_keys: pictures
+                .iter()
+                .map(|p| p.key.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            pictures,
+            raw_frame: Some(frame),
+            lens,
+            px: Some(px.join(",")),
         })
     }
 
@@ -928,20 +1126,118 @@ for line in sys.stdin:
         let enc = VisionEncoder::new(cfg).unwrap();
         let pic = vec![7u8; 40];
         let key1 = picture_key(&pic);
-        let payload = enc.encode_request(std::slice::from_ref(&pic)).unwrap();
+        let payload = enc
+            .encode_request(std::slice::from_ref(&pic), || Ok((32, 8, 4096)))
+            .unwrap();
         assert_eq!(payload.pictures[0].n, 4);
         assert_eq!(payload.img_keys, key1);
         assert!(payload.combine.exists());
         // cache hit: the same bytes reuse the same record file without a second ENC
-        let again = enc.encode_request(std::slice::from_ref(&pic)).unwrap();
+        let again = enc
+            .encode_request(std::slice::from_ref(&pic), || Ok((32, 8, 4096)))
+            .unwrap();
         assert_eq!(again.pictures[0].path, payload.pictures[0].path);
         assert_eq!(enc.out_dim(), Some(2560));
         // death mid-picture: the encoder exits(9) at the ENC (after its READY), and the retry
         // against a fresh spawn must succeed
         std::fs::write(&die_once, "x").unwrap();
-        let third = enc.encode_request(&[vec![9u8; 31]]).unwrap();
+        let third = enc
+            .encode_request(&[vec![9u8; 31]], || Ok((32, 8, 4096)))
+            .unwrap();
         assert_eq!(third.pictures[0].n, 4);
         assert!(!die_once.exists());
+        drop(enc);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn smart_resize_matches_the_tower() {
+        // every pair below is a same-tree reference tower's answer (talus-vision-selftest with
+        // align 32, token limits 8..4096): the predictor must agree with the tower bit for bit,
+        // including the min/max-pixel beta paths (300x200 upscaling, 9999x32 downscaling)
+        let (align, min_t, max_t) = (32i64, 8i64, 4096i64);
+        let resize = |w: i64, h: i64| {
+            let (pw, ph) = smart_resize(w, h, align, min_t * align * align, max_t * align * align);
+            (pw, ph, (pw / align) * (ph / align))
+        };
+        assert_eq!(resize(480, 320), (480, 320, 150));
+        assert_eq!(resize(1568, 1024), (1568, 1024, 1568));
+        assert_eq!(resize(400, 300), (416, 288, 117));
+        assert_eq!(resize(1000, 750), (992, 736, 713));
+        assert_eq!(resize(512, 512), (512, 512, 256));
+        assert_eq!(resize(1536, 1536), (1536, 1536, 2304));
+        assert_eq!(resize(9999, 32), (9984, 32, 312));
+        assert_eq!(resize(300, 200), (288, 192, 54));
+        assert_eq!(resize(400, 260), (416, 256, 104));
+    }
+
+    #[test]
+    fn image_size_reads_the_four_formats() {
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&[0, 0, 0, 13, b'I', b'H', b'D', b'R']);
+        png.extend_from_slice(&400u32.to_be_bytes());
+        png.extend_from_slice(&300u32.to_be_bytes());
+        assert_eq!(image_size(&png).unwrap(), (400, 300));
+        let mut bmp = b"BM".to_vec();
+        bmp.extend_from_slice(&[0u8; 16]); // size(4)+reserved(4)+offset(4)+DIB size(4): up to 18
+        bmp[2..6].copy_from_slice(&62u32.to_le_bytes());
+        bmp.extend_from_slice(&400i32.to_le_bytes());
+        bmp.extend_from_slice(&(-260i32).to_le_bytes()); // top-down DIB: negative height
+        assert_eq!(image_size(&bmp).unwrap(), (400, 260));
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend_from_slice(&640u16.to_le_bytes());
+        gif.extend_from_slice(&480u16.to_le_bytes());
+        assert_eq!(image_size(&gif).unwrap(), (640, 480));
+        // a JPEG with an APP0 before the SOF: the walk must skip it
+        let mut jpg = vec![0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10];
+        jpg.extend_from_slice(&[0u8; 14]);
+        jpg.extend_from_slice(&[0xff, 0xc0, 0x00, 0x11, 0x08]);
+        jpg.extend_from_slice(&200u16.to_be_bytes()); // height first
+        jpg.extend_from_slice(&300u16.to_be_bytes());
+        assert_eq!(image_size(&jpg).unwrap(), (300, 200));
+    }
+
+    #[test]
+    fn native_encode_frames_the_request_without_the_encoder() {
+        let dir = std::env::temp_dir().join(format!("talus-vision-native-{}", std::process::id()));
+        let cfg = VisionConfig {
+            mmproj: PathBuf::from("/no/mmproj"),
+            native: true,
+            cache_dir: Some(dir.clone()),
+            ..Default::default()
+        };
+        let enc = VisionEncoder::new(cfg).unwrap();
+        // a 480x320 "PNG" (header only: the native path never decodes, it frames the bytes)
+        let mut pic = b"\x89PNG\r\n\x1a\n".to_vec();
+        pic.extend_from_slice(&[0, 0, 0, 13, b'I', b'H', b'D', b'R']);
+        pic.extend_from_slice(&480u32.to_be_bytes());
+        pic.extend_from_slice(&320u32.to_be_bytes());
+        let geom_calls = std::cell::Cell::new(0);
+        let payload = enc
+            .encode_request(std::slice::from_ref(&pic), || {
+                geom_calls.set(geom_calls.get() + 1);
+                Ok((32, 8, 4096))
+            })
+            .unwrap();
+        assert_eq!(payload.combine.as_path(), std::path::Path::new("@raw"));
+        assert_eq!(payload.pictures[0].n, 150);
+        assert_eq!(payload.lens, vec![pic.len() as u64]);
+        assert_eq!(payload.raw_frame.as_deref(), Some(pic.as_slice()));
+        assert_eq!(payload.px.as_deref(), Some("480x320"));
+        // second request: the geometry was asked once (kept), and the frame is rebuilt anyway -
+        // the tower re-encodes, this server only caches the grid
+        let again = enc
+            .encode_request(&[pic.clone(), pic.clone()], || {
+                geom_calls.set(geom_calls.get() + 1);
+                Ok((32, 8, 4096))
+            })
+            .unwrap();
+        assert_eq!(geom_calls.get(), 1);
+        let key = picture_key(&pic);
+        assert_eq!(payload.img_keys, key);
+        assert_eq!(again.img_keys, format!("{key},{key}")); // two pictures, one cached grid
+        assert_eq!(again.lens, vec![pic.len() as u64; 2]);
+        assert_eq!(again.raw_frame.as_deref().unwrap().len(), 2 * pic.len());
         drop(enc);
         let _ = std::fs::remove_dir_all(&dir);
     }

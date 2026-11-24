@@ -559,7 +559,8 @@ impl ServerConfig {
             }
         }
 
-        // The optional "vision" block (option B, vision.rs): the strata-vision encoder subprocess.
+        // The optional "vision" block: either the strata-vision encoder subprocess, or "native":
+        // true for the vision tower compiled into the engine's kernel library (vision.rs).
         // Present = the engine must take GENI requests, so `--vision` joins the args unless the
         // config already carries it (mirrors serve/server.py adding --vision for its Vision class).
         if let Some(vb) = val.get("vision") {
@@ -577,6 +578,27 @@ impl ServerConfig {
                     other => other.to_json_string(),
                 };
                 cfg.engine_env.push((k.clone(), s));
+            }
+        }
+        // The native vision tower (the "vision" block above): the tower reads its mmproj from
+        // the engine's environment.  Both serve loops encode @raw pictures with it - the Rust
+        // loop in-process, the C++ loop (which owns the batch slots) through the same
+        // tk_vision calls - so nothing about native mode constrains --batch anymore.
+        // After the config's own "env" so an explicit entry of either key wins, as for the
+        // PCACHE keys below.
+        if cfg.vision.as_ref().is_some_and(|v| v.native) {
+            let mmproj = cfg
+                .vision
+                .as_ref()
+                .map(|v| v.mmproj.display().to_string())
+                .unwrap_or_default();
+            for (k, v) in [
+                ("TALUS_VISION_MM", mmproj),
+                ("TALUS_FN_RUST_VISION", "1".to_string()),
+            ] {
+                if !cfg.engine_env.iter().any(|(ek, _)| ek == k) {
+                    cfg.engine_env.push((k.to_string(), v));
+                }
             }
         }
         // Disk tier of the prompt cache: run-config keys for the engine's TALUS_PCACHE_DISK* environment

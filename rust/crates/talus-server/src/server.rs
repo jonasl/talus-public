@@ -509,6 +509,9 @@ fn warm_up(config: &ServerConfig, engine: &dyn Engine, tokenizer: &ByteTokenizer
         stop_strings: Vec::new(),
         embeddings: None,
         img_keys: None,
+        raw_frame: None,
+        lens: Vec::new(),
+        img_px: None,
     };
     let t0 = Instant::now();
     let r = engine.generate(
@@ -2937,6 +2940,9 @@ fn handle_llama_completion(
         stop_strings: stops.clone(),
         embeddings: None,
         img_keys: None,
+        raw_frame: None,
+        lens: Vec::new(),
+        img_px: None,
     };
 
     if !want_stream {
@@ -3191,6 +3197,9 @@ fn handle_openai_completions(
         stop_strings: stops.clone(),
         embeddings: None,
         img_keys: None,
+        raw_frame: None,
+        lens: Vec::new(),
+        img_px: None,
     };
 
     if !want_stream {
@@ -3463,11 +3472,16 @@ struct PreparedChat {
 }
 
 /// The GENI arguments a request's pictures produced: the combine file the engine reads and the
-/// `img_keys=` list. `None` anywhere downstream means the request carried no pictures.
+/// `img_keys=` list. `None` anywhere downstream means the request carried no pictures.  The
+/// native tower's variant carries the `@raw` frame instead of a file (`embeddings` holds the
+/// `@raw` marker), with the per-picture byte lengths and the size predictions the engine checks.
 #[derive(Clone, Debug, PartialEq)]
 struct VisionHandoff {
     embeddings: String,
     img_keys: String,
+    raw_frame: Option<Arc<Vec<u8>>>,
+    lens: Vec<u64>,
+    px: Option<String>,
 }
 
 /// Render, encode, and lay this request's pictures: the plain prompt ids, whether thinking is on,
@@ -3507,7 +3521,9 @@ fn attach_pictures(
         crate::vision::sniff(&bytes)?;
         bufs.push(bytes);
     }
-    let payload = enc.encode_request(&bufs)?;
+    let payload = enc.encode_request(&bufs, || {
+        state.engine.vgeom().map_err(|e| format!("vision: {e}"))
+    })?;
     let tok = &state.tokenizer;
     let pad = tok
         .encode(crate::tokenizer::IMAGE_PAD, true)
@@ -3527,6 +3543,9 @@ fn attach_pictures(
     Ok(Some(VisionHandoff {
         embeddings: payload.combine.to_string_lossy().into_owned(),
         img_keys: payload.img_keys,
+        raw_frame: payload.raw_frame.map(Arc::new),
+        lens: payload.lens,
+        px: payload.px,
     }))
 }
 
@@ -3737,6 +3756,13 @@ where
         stop_strings: Vec::new(),
         embeddings: prep.vision.as_ref().map(|v| v.embeddings.clone()),
         img_keys: prep.vision.as_ref().map(|v| v.img_keys.clone()),
+        raw_frame: prep.vision.as_ref().and_then(|v| v.raw_frame.clone()),
+        lens: prep
+            .vision
+            .as_ref()
+            .map(|v| v.lens.clone())
+            .unwrap_or_default(),
+        img_px: prep.vision.as_ref().and_then(|v| v.px.clone()),
     };
 
     let emit_filtered = |evs: Vec<Event>,

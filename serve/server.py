@@ -264,6 +264,74 @@ def engine_frozen(base: tuple[float, int], now: tuple[float, int]) -> bool:
 
 
 VISION_READY_S = _timeout_env("STRATA_VISION_READY_S", 300.0)
+
+# the native in-engine tower's picture geometry (its "@raw" mode): the server must count image
+# tokens before the request goes out, and predicts the tower's resize with this.  It mirrors
+# src/vision/image_prep.cpp term for term, C float arithmetic and all (rounding is where double
+# arithmetic would disagree), and the engine checks every prediction against what its tower
+# actually prepared - an ERR naming both sizes, never a silently wrong picture.
+def _cf(x) -> float:
+    """the nearest C `float` to x: the tower's smart_resize computes in float32"""
+    return struct.unpack("f", struct.pack("f", x))[0]
+
+
+def _round_by_factor(x: float, a: int) -> int:
+    return int(math.floor(abs(_cf(x) / _cf(a)) + 0.5)) * a    # std::round: half away from zero
+
+
+def _ceil_by_factor(x: float, a: int) -> int:
+    return int(math.ceil(_cf(x) / _cf(a))) * a
+
+
+def _floor_by_factor(x: float, a: int) -> int:
+    return int(math.floor(_cf(x) / _cf(a))) * a
+
+
+def _vision_image_size(data: bytes) -> tuple[int, int]:
+    """the picture's pixel size from its header - the four formats `Vision.normalize` passes
+    through are the four readable without a decoder; anything else it already rewrote as PNG"""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return struct.unpack(">II", data[16:24])              # IHDR
+    if data[:2] == b"BM":
+        w, h = struct.unpack("<ii", data[18:26])              # DIB: negative height = top-down
+        return w, abs(h)
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        w, h = struct.unpack("<HH", data[6:10])
+        return w, h
+    if data[:3] == b"\xff\xd8\xff":                           # JPEG: walk the markers to SOF
+        i = 2
+        frame = (0xC0, 0xC1, 0xC2, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF)
+        while i + 9 <= len(data):
+            if data[i] != 0xFF:
+                i += 1                                        # padding between markers
+                continue
+            if data[i + 1] in frame:
+                h, w = struct.unpack(">HH", data[i + 5:i + 9])
+                return w, h
+            if data[i + 1] in (0xD8, 0x01) or 0xD0 <= data[i + 1] <= 0xD9:
+                i += 2                                        # markers without a length
+                continue
+            i += 2 + struct.unpack(">H", data[i + 2:i + 4])[0]   # skip this segment
+        raise ValueError("the JPEG has no start-of-frame marker")
+    raise ValueError("could not read the picture's size (not a PNG, JPEG, BMP or GIF?)")
+
+
+def vision_smart_resize(width: int, height: int, align: int, min_pixels: int, max_pixels: int):
+    """the tower's target size for a `width x height` picture (HF's smart_resize, as mtmd and
+    src/vision/image_prep.cpp do it): sides rounded to `align`, then bounded by the pixel limits
+    (0 = no bound).  -> (w, h)"""
+    w_bar = max(align, _round_by_factor(width, align))
+    h_bar = max(align, _round_by_factor(height, align))
+    if max_pixels > 0 and h_bar * w_bar > max_pixels:
+        beta = _cf(math.sqrt(_cf(_cf(_cf(height) * _cf(width)) / _cf(max_pixels))))
+        h_bar = max(align, _floor_by_factor(_cf(height) / beta, align))
+        w_bar = max(align, _floor_by_factor(_cf(width) / beta, align))
+    elif min_pixels > 0 and h_bar * w_bar < min_pixels:
+        beta = _cf(math.sqrt(_cf(_cf(min_pixels) / _cf(_cf(height) * _cf(width)))))
+        h_bar = _ceil_by_factor(_cf(height) * beta, align)
+        w_bar = _ceil_by_factor(_cf(width) * beta, align)
+    return w_bar, h_bar
+
 VISION_ENCODE_S = _timeout_env("STRATA_VISION_ENCODE_S", 300.0)
 ENGINE_READY_S = _timeout_env("STRATA_ENGINE_READY_S", 900.0)
 
@@ -1143,6 +1211,32 @@ class StrataEngine:
             if time.time() > deadline:
                 raise EngineDied("the engine did not answer the VRAM command")
 
+    def vgeom(self, timeout: float = 30.0) -> tuple[int, int, int]:
+        """`VGEOM` between requests (the caller holds the service's FIFO, as `vram` does): the native
+        vision tower's geometry constants - (align, min_tokens, max_tokens) - for this server's own
+        resize predictor.  EngineDied when the engine is gone, ValueError when it has no tower (it
+        answers ERR)."""
+        if not self.alive():
+            raise EngineDied("the engine is not running")
+        self.proc.stdin.write("VGEOM\n")
+        self.proc.stdin.flush()
+        deadline = time.time() + timeout
+        while True:
+            try:
+                line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+            except queue.Empty:
+                raise EngineDied("the engine did not answer the VGEOM command") from None
+            if line is None:
+                raise EngineDied("the engine ended")
+            line = line.strip()
+            if line.startswith("ERR"):
+                raise ValueError(line[4:].strip() or "the engine refused the VGEOM command")
+            f = line.split()
+            if f[:1] == ["VGEOM"] and len(f) >= 4:
+                return int(f[1]), int(f[2]), int(f[3])
+            if time.time() > deadline:
+                raise EngineDied("the engine did not answer the VGEOM command")
+
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
         keys = ""
@@ -1874,10 +1968,13 @@ class StrataEngine:
                          "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None})
         return view
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, frame=None, lens=None, img_px=None):
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
-        has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
+        has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new.
+        `embeddings`: the request's image file (GENI), or "@raw" - then `frame` holds the request's encoded
+        pictures (one after another), `lens` their lengths, and `img_px` this server's size predictions for the
+        engine to check against its tower."""
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
         bias_api.validate_request(sampling or {}, self, None)
@@ -1887,10 +1984,22 @@ class StrataEngine:
         self.progress, self.progress_ms, self.reused = None, 0, 0
         self.prefill_tok_s_mean = None
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
-        head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
-            f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
+        keys = self.sampling_keys(sampling or {})
+        if frame:
+            # @raw: the picture bytes follow the line at once, no newline between; the engine
+            # reads exactly the img_bytes lengths, so a STOP mid-frame is not a risk.  The keys
+            # go before the emb-path token (@raw), as the engine's own line form puts it last.
+            keys += " img_bytes=" + ",".join(str(x) for x in (lens or [len(frame)]))
+            if img_px:
+                keys += f" img_px={img_px}"
+            head = f"GENI {int(max_new)}{keys} {embeddings}"
+        else:
+            head = f"GENI {int(max_new)}{keys} {embeddings}" if embeddings else \
+                f"GEN {int(max_new)}{keys}"
         try:
             self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
+            if frame:
+                self.proc.stdin.write(frame)
             self.proc.stdin.flush()
         except OSError:                                  # the pipe is gone: the engine died (not the client)
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
@@ -2251,6 +2360,29 @@ class Vision:
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None, lazy: bool = False):
         absolute = lambda p: os.path.abspath(p) if os.path.dirname(str(p)) else p   # the encoder runs in its own dir (#480)  # noqa: E731
+        # "native": true - the tower lives inside the engine (libtalus_kernels.so) and decodes the
+        # request's pictures itself (`@raw`): no encoder child, no embeddings files.  The engine
+        # needs the mmproj and the Rust serve loop's handoff in its environment (child_env), and
+        # batch slots off (engine_args); the server keeps only the normalized bytes and a token
+        # count here.  Elastic makes no sense (the tower is loaded with the engine and never idle).
+        self.native = cfg.get("native") is True
+        self.geom = None                                   # the engine tower's (align, min, max) tokens
+        self.dir = self.work_dir()
+        self.lock = threading.Lock()
+        self.cache: dict[str, tuple] = {}                  # (embeddings file | (w, h), token count)
+        self.spawn = None
+        self.proc = None
+        self.stopped = True
+        if self.native:
+            self.elastic = False
+            self.elastic_mib = 0
+            self.elastic_idle_s = 0.0
+            self.min_tokens = int(cfg.get("min_tokens") or 0)
+            self.max_tokens = int(cfg.get("max_tokens") or 0)
+            if not cfg.get("mmproj"):
+                raise ValueError('the vision section needs "mmproj" (the tower weights) with "native": true')
+            self.mmproj = cfg["mmproj"]
+            return
         args = [absolute(cfg["exe"]), "--mmproj", absolute(cfg["mmproj"]), "--model", absolute(cfg["model"])]
         if cfg.get("gpu"):
             args.append("--gpu")
@@ -2260,12 +2392,7 @@ class Vision:
             args += ["--max-tokens", str(cfg["max_tokens"])]
         if cfg.get("min_tokens"):                       # #767: mtmd's image_min_tokens (a hand-edited key)
             args += ["--min-tokens", str(cfg["min_tokens"])]
-        self.dir = self.work_dir()
         self.spawn = (args, log, env)                   # to start it again after an unload
-        self.proc = None
-        self.stopped = True
-        self.lock = threading.Lock()
-        self.cache: dict[str, tuple[Path, int]] = {}
         # opt-in (the vision section's "elastic": true, with the config's "vram_elastic"): the encoder starts with the
         # first picture and stops after elastic_idle_s without one; while it runs, the engine's expert cache keeps
         # elastic_mib of VRAM free for it (Service._vision_up / _vision_idle_down)
@@ -2466,6 +2593,52 @@ class Vision:
                 if str(self.cache[old][0]) not in held:
                     self.cache.pop(old)[0].unlink(missing_ok=True)
             return self.cache[key]
+
+    def native_encode(self, source, engine) -> tuple[bytes, int, str]:
+        """the native tower's `encode`: normalize (the child's format rules apply unchanged), then
+        predict the tower's own resize.  -> (the picture's normalized bytes, token count, the
+        predicted size as `w x h`); the bytes travel with the request as its `@raw` frame every
+        time - the tower re-encodes each picture (37 ms, cheaper than caching its rows across
+        requests) -, and the prediction rides along as `img_px` purely for the engine's check: a
+        predictor here drifting from the tower is an ERR naming both sizes, never a wrong picture.
+        The cache holds only the geometry: a conversation re-sending a picture re-normalizes and
+        re-sends it (its bytes are small next to an encode's rows)."""
+        data = self.normalize(source if isinstance(source, bytes) else self.load(source))
+        key = hashlib.sha256(data).hexdigest()[:32]
+        with self.lock:
+            if key not in self.cache:
+                align, min_t, max_t = self._geom_for(engine)
+                # the vision section's min_tokens/max_tokens override the tower's, as --min-tokens/
+                # --max-tokens override them for the child encoder (#767)
+                min_t = self.min_tokens or min_t
+                max_t = self.max_tokens or max_t
+                w, h = _vision_image_size(data)
+                pw, ph = vision_smart_resize(w, h, align, min_t * align * align, max_t * align * align)
+                self.cache[key] = ((pw, ph), (pw // align) * (ph // align))
+                while len(self.cache) > 64:                        # as the child's cache evicts
+                    self.cache.pop(next(iter(self.cache)))
+            (pw, ph), n = self.cache[key]
+            self.cache[key] = self.cache.pop(key)                  # most recently used last
+        return data, n, f"{pw}x{ph}"
+
+    def _geom_for(self, engine):
+        """the engine tower's geometry constants, fetched from the engine once per process (#cf.
+        `vram`: between requests, the caller holds the turn); a towerless or VGEOM-blind engine is
+        a clear error, not a wrong token count"""
+        if self.geom is None:
+            if not hasattr(engine, "vgeom"):
+                raise ValueError("the engine does not answer VGEOM (too old for native images?)")
+            self.geom = engine.vgeom()
+        return self.geom
+
+    def alive(self) -> bool:
+        return True                                      # the tower is loaded with the engine
+
+    def unload(self):
+        pass                                             # nothing to release: the tower goes with the engine
+
+    def restart(self):
+        pass                                             # nothing of its own to start again
 
     def close(self):
         proc, self.proc = self.proc, None
@@ -3902,8 +4075,23 @@ class Service:
             with self._turn(cancel):
                 self._vision_up()
                 try:
-                    encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
-                               else [self.vision.encode(src) for src in images])
+                    if getattr(self.vision, "native", False):
+                        # the in-engine tower: (bytes, token count, predicted size); no encoder
+                        # child, no FIFO dance for GPU sharing - the tower shares the engine's
+                        encoded, preds = [], []
+                        for src in images:
+                            if cancel.is_set():
+                                raise ClientGone()
+                            b, n, px = self.vision.native_encode(src, self.engine)
+                            encoded.append((b, n))
+                            preds.append(px)
+                        self.embeddings.px = ",".join(preds)
+                        self.embeddings.lens = [len(b) for b, _ in encoded]
+                        self.embeddings.frame = b"".join(b for b, _ in encoded)
+                    elif hasattr(self.vision, "encode_all"):
+                        encoded = self.vision.encode_all(images, cancel)
+                    else:
+                        encoded = [self.vision.encode(src) for src in images]
                 finally:
                     self.last_image_at = time.time()
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
@@ -3950,16 +4138,23 @@ class Service:
                                  "model's strata-<model>.json to shorten it to the room left (#545)")
             max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
         if images:
-            # The request's images in one file for GENI (~10 MB a picture), written once nothing above refuses the
-            # request: one refused after it (the engine starting, no room) left it in the vision directory for good,
-            # one more for every retry of a 503.  run() deletes it; drop_embeddings() if run() never starts.
-            combined = combined_embeddings_path(self.vision.dir, sum(Path(p).stat().st_size for p, _ in encoded))
-            self.embeddings.path = combined             # first, so a half-written one is found as well
-            # #2228: each picture's key is its normalized bytes' hash (the encoder's file name), so the engine's
-            # conversation cache matches a picture by what it is, not by its embedding floats: a picture encoded again
-            # (an encoder restart, the cache's eviction) with other bits still matches its checkpoints
-            self.embeddings.keys = [Path(p).stem[:16] for p, _ in encoded]
-            write_temporary(combined, [p for p, _ in encoded])
+            if getattr(self.vision, "native", False):
+                # @raw: the engine decodes the pictures itself.  Their bytes travel right behind
+                # the request line (the tower re-encodes every picture each request), and the
+                # predicted sizes ride as img_px for the engine to check against its own resize.
+                self.embeddings.path = "@raw"
+                self.embeddings.keys = [hashlib.sha256(b).hexdigest()[:16] for b, _ in encoded]
+            else:
+                # The request's images in one file for GENI (~10 MB a picture), written once nothing above refuses the
+                # request: one refused after it (the engine starting, no room) left it in the vision directory for good,
+                # one more for every retry of a 503.  run() deletes it; drop_embeddings() if run() never starts.
+                combined = combined_embeddings_path(self.vision.dir, sum(Path(p).stat().st_size for p, _ in encoded))
+                self.embeddings.path = combined             # first, so a half-written one is found as well
+                # #2228: each picture's key is its normalized bytes' hash (the encoder's file name), so the engine's
+                # conversation cache matches a picture by what it is, not by its embedding floats: a picture encoded again
+                # (an encoder restart, the cache's eviction) with other bits still matches its checkpoints
+                self.embeddings.keys = [Path(p).stem[:16] for p, _ in encoded]
+                write_temporary(combined, [p for p, _ in encoded])
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images))
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
@@ -4151,6 +4346,11 @@ class Service:
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
+        # the native tower's @raw form: the frame of encoded pictures behind the line, and the
+        # server's size predictions for the engine to check (all None on the file/@px paths)
+        frame, self.embeddings.frame = getattr(self.embeddings, "frame", None), None
+        lens, self.embeddings.lens = getattr(self.embeddings, "lens", None), None
+        px, self.embeddings.px = getattr(self.embeddings, "px", None), None
         if emb and img_keys:
             sampling = {**(sampling or {}), "strata_img_keys": img_keys}   # #2228: sent beside the embeddings file
         # Only a DONE line replaces engine.last, so a request that died, errored or was disconnected must not have
@@ -4237,8 +4437,9 @@ class Service:
                     while True:
                         segment_before = getattr(self.engine, "last", None)
                         segments_before = len(segments)     # (#879: a pass sent again leaves no segment)
-                        gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
-                            else self.engine.generate(prompt, max_new - n, sampling, cancel)
+                        gen = (self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb,
+                                                    frame=frame, lens=lens, img_px=px)
+                               if emb else self.engine.generate(prompt, max_new - n, sampling, cancel))
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
@@ -6790,6 +6991,18 @@ def main() -> int:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
             print(f"[talus] sampling defaults from the config: {pretty}", flush=True)
         lazy = a.lazy or cfg.get("lazy_load") is True
+        native_vision = isinstance(cfg.get("vision"), dict) and cfg["vision"].get("native") is True
+        eargs = engine_args(cfg)                         # the engine's args; native vision rewrites them below
+        if native_vision:
+            # the tower lives inside the engine (libtalus_kernels.so): point it at the weights and
+            # hand image requests to the Rust serve loop; the native path does not drive the
+            # engine's batch slots, so a config that asked for them does not get them
+            env["TALUS_FN_RUST_VISION"] = "1"
+            if "--batch-mtp" in eargs:
+                eargs.remove("--batch-mtp")              # a valueless flag: keep it from dangling
+            for flag in ("--batch", "--slots"):
+                while flag in eargs:
+                    del eargs[eargs.index(flag):eargs.index(flag) + 2]
         if cfg.get("vision"):
             elastic = cfg["vision"].get("elastic") is True and cfg.get("vram_elastic") is True
             print("the vision encoder starts with the first picture (elastic) ..." if elastic else
@@ -6799,6 +7012,8 @@ def main() -> int:
             vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                         if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
                     for k, v in cfg["vision"].items()}
+            if vcfg.get("native") is True:
+                env["TALUS_VISION_MM"] = str(vcfg["mmproj"])     # the engine's tower reads the weights from here
             if vcfg.get("elastic") is True and cfg.get("vram_elastic") is not True:
                 print('[talus] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
                       "encoder its VRAM): the encoder starts with the model instead", flush=True)
@@ -6807,7 +7022,7 @@ def main() -> int:
                             env=vision_env(cfg, env), lazy=lazy)
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
-        warn_budget_over_ram(engine_args(cfg) if "args" in cfg else [])      # #1080
+        warn_budget_over_ram(eargs if "args" in cfg else [])      # #1080
         if layer_split_of(cfg):
             try:
                 split = layer_split_value(cfg)          # #644: before the (minutes-long) start
@@ -6836,7 +7051,7 @@ def main() -> int:
         if groups:
             engine = start_replicas(cfg, groups, exe, effort_end or [], lazy)
         else:
-            engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
+            engine = StrataEngine(exe, eargs + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
                                   env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))

@@ -192,6 +192,15 @@ pub struct GenerateRequest {
     /// the `img_keys=` value (#2228): each picture's key (16 hex), comma list, prompt order. Only
     /// sent with `embeddings`; without it the engine matches pictures by embedding hash instead.
     pub img_keys: Option<String>,
+    /// the native tower's `@raw` form: the request's encoded pictures, one after another, written
+    /// right behind the GENI line (framed by `lens`); `None` = the SVE-file path or no pictures.
+    pub raw_frame: Option<Arc<Vec<u8>>>,
+    /// the per-picture byte lengths of `raw_frame` (`img_bytes=`), prompt order.
+    pub lens: Vec<u64>,
+    /// the native tower's `img_px=`: this server's prediction of each picture's resized size,
+    /// which the engine checks against what its tower prepared (drift = ERR, never a wrong
+    /// picture).  Optional in the protocol; sent whenever the predictor knows.
+    pub img_px: Option<String>,
 }
 
 /// E1: one generated token's logprob under the target model at temperature 1 (before sampling filters), and the
@@ -547,6 +556,16 @@ pub trait Engine: Send + Sync {
 
     fn erase_slot(&self, _slot_id: usize) -> Result<usize, EngineError> {
         Ok(0)
+    }
+
+    /// `VGEOM` between requests: the native vision tower's geometry constants
+    /// (align, min_tokens, max_tokens) for the server's own resize predictor.  Engines without
+    /// the tower answer ERR; engines without the command at all never get here (the server asks
+    /// only when the config says the tower is native).
+    fn vgeom(&self) -> Result<(i64, i64, i64), EngineError> {
+        Err(EngineError::InvalidRequest(
+            "this engine does not answer VGEOM".to_string(),
+        ))
     }
 
     /// E6: the engine constrains output to `SamplingParams::json_schema`. Engines that do not say so get a 400 for
@@ -941,6 +960,9 @@ impl ScriptedMockEngine {
                     stop_strings: Vec::new(),
                     embeddings: None,
                     img_keys: None,
+                    raw_frame: None,
+                    lens: Vec::new(),
+                    img_px: None,
                 };
                 let cancel = Arc::new(AtomicBool::new(false));
                 let mut emitted_tokens = Vec::new();
@@ -1930,7 +1952,26 @@ impl StdioSubprocessEngine {
             .collect::<Vec<_>>()
             .join(",");
         // pictures: GENI's embeddings file is the first space-split token without an `=`, so it
-        // goes after the sampling keys and before the ids (serve/server.py's head construction)
+        // goes after the sampling keys and before the ids (serve/server.py's head construction).
+        // The native `@raw` form: the per-picture byte lengths frame the frame behind the line,
+        // and the server's size predictions ride for the tower to check — both keys before the
+        // emb-path token, which is the engine's own line order.
+        let mut keys = keys;
+        let mut frame = None;
+        if let (Some(f), true) = (&req.raw_frame, req.embeddings.as_deref() == Some("@raw")) {
+            keys += &format!(
+                " img_bytes={}",
+                req.lens
+                    .iter()
+                    .map(|l| l.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            if let Some(px) = &req.img_px {
+                keys += &format!(" img_px={px}");
+            }
+            frame = Some(f.clone());
+        }
         let cmd = match &req.embeddings {
             Some(path) => match &req.img_keys {
                 Some(k) => format!(
@@ -1943,8 +1984,15 @@ impl StdioSubprocessEngine {
         };
         {
             let mut stdin = handle.stdin.lock().unwrap();
-            stdin
-                .write_all(cmd.as_bytes())
+            let wrote = match frame {
+                // the frame follows the line at once, no newline between: the engine reads
+                // exactly the img_bytes lengths, so control lines cannot hide in it
+                Some(f) => stdin
+                    .write_all(cmd.as_bytes())
+                    .and_then(|_| stdin.write_all(&f)),
+                None => stdin.write_all(cmd.as_bytes()),
+            };
+            wrote
                 .and_then(|_| stdin.flush())
                 .map_err(|e| EngineError::EngineDied(format!("{STDIN_WRITE_FAILED}: {e}")))?;
         }
@@ -2357,6 +2405,52 @@ impl Engine for StdioSubprocessEngine {
             Ok(rest.trim().parse::<usize>().unwrap_or(0))
         } else {
             Ok(0)
+        }
+    }
+
+    fn vgeom(&self) -> Result<(i64, i64, i64), EngineError> {
+        let mut slot = self.proc.lock().unwrap();
+        self.busy.fetch_add(1, Ordering::SeqCst);
+        let _busy = BusyGuard(&self.busy);
+        let handle = self.running(&mut slot)?;
+        {
+            let mut stdin = handle.stdin.lock().unwrap();
+            stdin
+                .write_all(b"VGEOM\n")
+                .and_then(|_| stdin.flush())
+                .map_err(|e| EngineError::EngineDied(format!("VGEOM write failed: {e}")))?;
+        }
+        // progress lines can sit between the command and the answer; only VGEOM/ERR settle it
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = handle
+                .stdout
+                .read_line(&mut line)
+                .map_err(|e| EngineError::EngineDied(format!("VGEOM read failed: {e}")))?;
+            if n == 0 {
+                return Err(EngineError::EngineDied(
+                    "engine exited during VGEOM".to_string(),
+                ));
+            }
+            let trimmed = line.trim();
+            let mut f = trimmed.split_whitespace();
+            match f.next().unwrap_or("") {
+                "VGEOM" => {
+                    let (Some(align), Some(min_t), Some(max_t)) = (
+                        f.next().and_then(|x| x.parse().ok()),
+                        f.next().and_then(|x| x.parse().ok()),
+                        f.next().and_then(|x| x.parse().ok()),
+                    ) else {
+                        return Err(EngineError::InvalidRequest(format!(
+                            "bad VGEOM answer: {trimmed}"
+                        )));
+                    };
+                    return Ok((align, min_t, max_t));
+                }
+                "ERR" => return Err(EngineError::InvalidRequest(trimmed[3..].trim().to_string())),
+                _ => continue,
+            }
         }
     }
 }

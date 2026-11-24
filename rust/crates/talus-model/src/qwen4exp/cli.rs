@@ -142,6 +142,10 @@ pub struct ParsedServeGenRequest {
     /// D3b-2: the pixel form (`@px` where the SVE path stands) and its raw `img_px=` value
     pub pixels: bool,
     pub img_px: Option<String>,
+    /// Raw form (`@raw`): the tower decodes the frame itself; `img_bytes` is its exact
+    /// per-picture framing, `img_px` (optional here) the server's size prediction
+    pub raw: bool,
+    pub img_bytes: Option<String>,
 }
 
 /// Parses a `GEN <max_new> [key=val ...] <id,id,...>` protocol line.
@@ -210,6 +214,8 @@ pub fn parse_serve_gen_line_v(
         img_keys: Vec::new(),
         pixels: false,
         img_px: None,
+        raw: false,
+        img_bytes: None,
     };
 
     let mut cursor = &rest[sp_idx..];
@@ -248,6 +254,7 @@ pub fn parse_serve_gen_line_v(
             "aux_cpus" => req.aux_cpus = if iv != 0 { 1 } else { 0 },
             "img_keys" => req.img_keys = parse_img_keys(val),
             "img_px" => req.img_px = Some(val.to_string()),
+            "img_bytes" => req.img_bytes = Some(val.to_string()),
             _ => {}
         }
         cursor = &cursor[tok_end..];
@@ -258,7 +265,10 @@ pub fn parse_serve_gen_line_v(
         match c.find(' ') {
             Some(gap) => {
                 req.emb_path = c[..gap].to_string();
-                req.pixels = req.emb_path == "@px";
+                // @raw is the pixel form's sibling: same framing machinery, but the
+                // tower decodes and the frame is sized by img_bytes
+                req.pixels = matches!(req.emb_path.as_str(), "@px" | "@raw");
+                req.raw = req.emb_path == "@raw";
                 cursor = &c[gap..];
             }
             None => return Err("ERR bad request: max_new".to_string()),
@@ -419,6 +429,28 @@ mod tests {
         let p = parse_serve_gen_line_v("GENI 8 img_keys=ab img_px=4x2,1x1 @px 1,2", 0.0, 0.0, true)
             .unwrap();
         assert!(p.pixels && p.img_px.as_deref() == Some("4x2,1x1"));
+        // the exact C1 gate line shape (one key, one size, long ids) - must parse as the pixel form
+        let long_ids = format!("{}476,5215,304,279,7350", "248056,".repeat(150));
+        let g = parse_serve_gen_line_v(
+            &format!("GENI 8 img_keys=deadbeef img_px=480x320 @px {long_ids}"),
+            0.0,
+            0.0,
+            true,
+        )
+        .unwrap();
+        assert!(g.geni && g.pixels, "geni={} pixels={}", g.geni, g.pixels);
+        // @raw is the pixel form's raw sibling: pixels=true, raw=true, framing by img_bytes
+        let raw_form = parse_serve_gen_line_v(
+            "GENI 8 img_keys=ab img_bytes=100,200 @raw 1,2",
+            0.0,
+            0.0,
+            true,
+        )
+        .unwrap();
+        assert!(raw_form.pixels && raw_form.raw && raw_form.img_px.is_none());
+        assert_eq!(raw_form.img_bytes.as_deref(), Some("100,200"));
+        // and @px must not read as raw
+        assert!(!p.raw);
         assert!(p.img_keys == vec![0xab] && p.ids == vec![1, 2]);
         assert!(!r.pixels && r.img_px.is_none());
     }

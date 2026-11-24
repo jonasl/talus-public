@@ -9,7 +9,7 @@
 //!   conditioning/decode, and speculative verify/MTP decode.
 //! - Keeps the legacy C++ loop selectable via `--cpp-engine` or `TALUS_FN_CPP=1`.
 
-use core::ffi::{c_char, c_double, c_float, c_int, c_void};
+use core::ffi::{c_char, c_double, c_float, c_int, c_long, c_void};
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
 use std::io::{BufRead, Write};
@@ -43,6 +43,9 @@ struct StdinShared {
 struct StdinReader {
     shared: Option<Arc<StdinShared>>,
     current_line: CString,
+    // the frame that followed the current line (the @raw picture form): the C++ serve loop
+    // picks it up through take_frame; held here so the bytes outlive the line they belong to
+    current_frame: Option<Vec<u8>>,
 }
 
 impl StdinReader {
@@ -50,6 +53,7 @@ impl StdinReader {
         Self {
             shared: None,
             current_line: CString::new("").unwrap(),
+            current_frame: None,
         }
     }
 
@@ -137,8 +141,9 @@ impl StdinReader {
                 guard = shared.cv.wait(guard).unwrap();
             }
         }
-        if let Some((s, _frame)) = guard.0.pop_front() {
+        if let Some((s, frame)) = guard.0.pop_front() {
             drop(guard);
+            self.current_frame = frame;
             let clean: Vec<u8> = s.into_bytes().into_iter().filter(|&b| b != 0).collect();
             let len = clean.len();
             self.current_line = unsafe { CString::from_vec_unchecked(clean) };
@@ -147,6 +152,15 @@ impl StdinReader {
             None
         } else {
             Some((std::ptr::null(), 0))
+        }
+    }
+
+    /// The frame that followed the line `next_line` last returned (the @raw picture bytes);
+    /// (null, 0) when that line had no frame.  Valid until the next `next_line` pops a pair.
+    fn take_frame(&mut self) -> (*const u8, usize) {
+        match self.current_frame.as_deref() {
+            Some(v) if !v.is_empty() => (v.as_ptr(), v.len()),
+            _ => (std::ptr::null(), 0),
         }
     }
 
@@ -515,6 +529,7 @@ impl Qwen4ExpDriverState {
             } else {
                 Some(cb_run_generate_loop)
             },
+            take_frame: Some(cb_take_frame),
         }
     }
 }
@@ -543,6 +558,17 @@ unsafe extern "C" fn cb_next_line(
         }
         None => -1,
     }
+}
+
+/// Hands the C++ serve loop the binary frame that followed the line cb_next_line last
+/// returned (the @raw picture bytes); null + 0 when that line carried none.
+unsafe extern "C" fn cb_take_frame(user_data: *mut c_void, len_out: *mut c_long) -> *const u8 {
+    let state = &mut *user_data.cast::<Qwen4ExpDriverState>();
+    let (ptr, len) = state.stdin_reader.take_frame();
+    if !len_out.is_null() {
+        *len_out = len as c_long;
+    }
+    ptr
 }
 
 unsafe extern "C" fn cb_clear_stop(user_data: *mut c_void) {
@@ -1060,8 +1086,13 @@ unsafe extern "C" fn cb_run_serve_loop(
         None => false,
     };
     let mut req_pictures: Option<crate::qwen4exp::vision_req::Pictures> = None;
-    // D3b-2: the in-process image encoder (TALUS_VISION_MOCK=<dir> = the test encoder; talus-vision plugs in here)
+    // D3b-2: the in-process image encoder (TALUS_VISION_MOCK=<dir> = the test encoder;
+    // TALUS_VISION_MM=<mmproj> = the native vision tower compiled into libtalus_kernels.so)
     let mut encoder: Option<Box<dyn crate::qwen4exp::vision::ImageEncoder>> = None;
+    // why the encoder is absent, when the absence is a loaded-but-refused native tower
+    let mut vision_note: Option<String> = None;
+    // pressure-floor bump for the native tower's device bytes (unified memory: they are host pages)
+    let mut vision_floor_bump: u64 = 0;
     if vision {
         if let Some(dir) = std::env::var_os("TALUS_VISION_MOCK") {
             encoder = Some(Box::new(crate::qwen4exp::vision::MockEncoder::new(
@@ -1072,6 +1103,29 @@ unsafe extern "C" fn cb_run_serve_loop(
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(16384),
             )));
+        } else if let Some(mm) = std::env::var_os("TALUS_VISION_MM") {
+            match crate::qwen4exp::vision::NativeEncoder::open(
+                std::path::Path::new(&mm),
+                std::env::var("TALUS_VISION_MAX_ROWS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(16384),
+            ) {
+                Ok(enc) => {
+                    vision_floor_bump = enc.floor_claim();
+                    eprintln!(
+                        "talus-qwen4exp: native vision tower: width {}, {} MiB on device (pressure floor +{} MiB)",
+                        crate::qwen4exp::vision::ImageEncoder::n_embd(&enc),
+                        enc.device_bytes() >> 20,
+                        vision_floor_bump >> 20
+                    );
+                    encoder = Some(Box::new(enc));
+                }
+                Err(e) => {
+                    eprintln!("talus-qwen4exp: {e}; pixel requests will say so");
+                    vision_note = Some(format!("{e}: pixel requests refused"));
+                }
+            }
         }
         if let Some(e) = encoder.as_ref() {
             if e.n_embd() != vinfo[2] {
@@ -1128,9 +1182,13 @@ unsafe extern "C" fn cb_run_serve_loop(
 
     // #40  ): the shared memory-pressure guard at the common 8 GiB floor; a GEN that arrives while the host is
     // under it fails with `ERR insufficient_memory` and the loop keeps serving (TransientArenas = host-heap trim; the
-    // expert cache / checkpoints are not shed here)
+    // expert cache / checkpoints are not shed here).  Option C: with the native vision tower loaded,
+    // its device bytes are host pages on the Halo and its encode needs host working set, so the floor
+    // rises by the tower's claim (the MiMo load-time-floor precedent, sized by measurement not guesswork).
     talus_mem::pressure::install(
-        talus_mem::pressure::PressureConfig::strix_default(),
+        talus_mem::pressure::PressureConfig::from_env(
+            talus_mem::DEFAULT_FLOOR_BYTES as u64 + vision_floor_bump,
+        ),
         "talus-qwen4exp",
     );
 
@@ -1140,6 +1198,17 @@ unsafe extern "C" fn cb_run_serve_loop(
             break;
         };
         let is_quit = line == "QUIT";
+        // `VGEOM`: the geometry constants for a server's own predictor, answered before
+        // the C++ pre-dispatch because it is a Rust-loop-only command (@raw mode)
+        if line == "VGEOM" {
+            let reply = match encoder.as_deref().and_then(|e| e.geom()) {
+                Some((align, min_t, max_t)) => format!("VGEOM {align} {min_t} {max_t}"),
+                None => "ERR VGEOM: this engine has no native tower".to_string(),
+            };
+            println!("{reply}");
+            let _ = std::io::stdout().flush();
+            continue;
+        }
         let c_line = CString::new(
             line.as_bytes()
                 .iter()
@@ -1174,6 +1243,16 @@ unsafe extern "C" fn cb_run_serve_loop(
                 continue;
             }
         };
+        if std::env::var_os("TALUS_FN_VISION_SAY").is_some() && line.starts_with("GENI ") {
+            // which branch a GENI line takes is the first question when the pixel form misfires
+            eprintln!(
+                "talus-qwen4exp: GENI parse: vision={vision} geni={} pixels={} emb={:?} frame={}B",
+                parsed.geni,
+                parsed.pixels,
+                parsed.emb_path,
+                frame.as_ref().map_or(0, |f| f.len())
+            );
+        }
 
         let mut req_bias: Vec<f32> = Vec::new();
         if let Some(ref btxt) = parsed.bias_text {
@@ -1222,51 +1301,58 @@ unsafe extern "C" fn cb_run_serve_loop(
                 cs.req_imgs.clear();
             }
             req_pictures = None;
+            // @px sizes its frame from img_px; @raw from img_bytes (its img_px, if given, is
+            // only the server's prediction - the tower checks it)
+            let lens = parsed
+                .img_bytes
+                .as_deref()
+                .and_then(crate::qwen4exp::vision::parse_img_bytes);
             let spec = parsed
                 .img_px
                 .as_deref()
                 .and_then(crate::qwen4exp::vision::parse_img_px);
-            let Some(spec) = spec else {
-                fail("img_px: expected <w>x<h>,... for the pixel form (@px)");
-                continue;
+            let (n_pics, frame_bytes) = if parsed.raw {
+                match &lens {
+                    Some(l) => (l.len(), l.iter().sum::<u64>() as usize),
+                    None => {
+                        fail("img_bytes: expected <n>,... for the raw form (@raw)");
+                        continue;
+                    }
+                }
+            } else {
+                match &spec {
+                    Some(s) => (s.sizes.len(), s.bytes),
+                    None => {
+                        fail("img_px: expected <w>x<h>,... for the pixel form (@px)");
+                        continue;
+                    }
+                }
             };
             let Some(frame) = frame.as_ref() else {
                 fail("img_px: the pixel frame is missing");
                 continue;
             };
-            if spec.bytes > crate::qwen4exp::vision::MAX_FRAME_BYTES || frame.len() != spec.bytes {
+            if frame_bytes > crate::qwen4exp::vision::MAX_FRAME_BYTES || frame.len() != frame_bytes
+            {
                 fail(&format!(
                     "the pixel frame is {} bytes; at most {} are accepted",
-                    spec.bytes,
+                    frame_bytes,
                     crate::qwen4exp::vision::MAX_FRAME_BYTES
                 ));
                 continue;
             }
-            if parsed.img_keys.len() != spec.sizes.len() {
+            if parsed.img_keys.len() != n_pics {
                 fail("img_keys: one key per picture is required with the pixel form");
                 continue;
             }
             let Some(enc) = encoder.as_mut() else {
-                fail("this engine has no image encoder");
+                fail(
+                    vision_note
+                        .as_deref()
+                        .unwrap_or("this engine has no image encoder"),
+                );
                 continue;
             };
-            let mut at = 0usize;
-            let imgs: Vec<crate::qwen4exp::vision::PixelImage> = spec
-                .sizes
-                .iter()
-                .zip(&parsed.img_keys)
-                .map(|(&(w, h), &key)| {
-                    let len = w as usize * h as usize * 3;
-                    let im = crate::qwen4exp::vision::PixelImage {
-                        w,
-                        h,
-                        rgb: &frame[at..at + len],
-                        key,
-                    };
-                    at += len;
-                    im
-                })
-                .collect();
             // the engine owns `done`; the encoder records it on the prefill's stream (the null stream here: the prompt
             // path orders after it on its own stream through the event wait below)
             let mut done: *mut c_void = std::ptr::null_mut();
@@ -1277,7 +1363,44 @@ unsafe extern "C" fn cb_run_serve_loop(
                 fail("the image encoder event could not be created");
                 continue;
             }
-            let res = enc.encode(&imgs, std::ptr::null_mut(), done);
+            let res = if parsed.raw {
+                let mut at = 0usize;
+                let raws: Vec<crate::qwen4exp::vision::RawImage> = lens
+                    .unwrap()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &len)| {
+                        let s = at;
+                        at += len as usize;
+                        crate::qwen4exp::vision::RawImage {
+                            data: &frame[s..at],
+                            key: parsed.img_keys[i],
+                            predict: spec.as_ref().and_then(|sp| sp.sizes.get(i)).copied(),
+                        }
+                    })
+                    .collect();
+                enc.encode_raw(&raws, std::ptr::null_mut(), done)
+            } else {
+                let mut at = 0usize;
+                let imgs: Vec<crate::qwen4exp::vision::PixelImage> = spec
+                    .unwrap()
+                    .sizes
+                    .iter()
+                    .zip(&parsed.img_keys)
+                    .map(|(&(w, h), &key)| {
+                        let len = w as usize * h as usize * 3;
+                        let im = crate::qwen4exp::vision::PixelImage {
+                            w,
+                            h,
+                            rgb: &frame[at..at + len],
+                            key,
+                        };
+                        at += len;
+                        im
+                    })
+                    .collect();
+                enc.encode(&imgs, std::ptr::null_mut(), done)
+            };
             // the prompt path's stream waits on `done` through a host wait here (one per request; the copy is the work)
             let synced = unsafe { hip_sys::hipEventSynchronize(done as _) } == hip_sys::hipSuccess;
             unsafe { hip_sys::hipEventDestroy(done as _) };

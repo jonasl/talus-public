@@ -1,6 +1,6 @@
 //! Dynamic FFI bindings to `include/talus_qwen4exp_kernels.h` in `libtalus_kernels.so`.
 
-use core::ffi::{c_char, c_double, c_float, c_int, c_void};
+use core::ffi::{c_char, c_double, c_float, c_int, c_long, c_void};
 use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
 
@@ -259,6 +259,8 @@ pub struct TkQwen4ExpRustDriver {
         Option<unsafe extern "C" fn(user_data: *mut c_void, ctx: *mut TkQwen4ExpServeCtx) -> c_int>,
     pub run_generate_loop:
         Option<unsafe extern "C" fn(user_data: *mut c_void, ctx: *mut TkQwen4ExpGenCtx) -> c_int>,
+    pub take_frame:
+        Option<unsafe extern "C" fn(user_data: *mut c_void, len_out: *mut c_long) -> *const u8>,
 }
 
 pub type FnRunWithRustDriver = unsafe extern "C" fn(

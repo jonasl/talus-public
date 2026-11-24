@@ -647,7 +647,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/vision/vit_gpu.cu")
     add_library(strata_vision STATIC
       src/vision/gguf_lite.cpp src/vision/vit_geometry.cpp src/vision/image_prep.cpp
-      src/vision/vit_ref.cpp src/vision/vit_gpu.cu)
+      src/vision/vit_ref.cpp src/vision/tk_vision.cpp src/vision/vit_gpu.cu)
     target_include_directories(strata_vision PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/vision)
     target_include_directories(strata_vision PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
     target_compile_features(strata_vision PUBLIC cxx_std_17)
@@ -1819,6 +1819,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   set(_talus_kernels_whole_archive strata_kernels strata_prefill)
   if(TARGET strata_mmq)
     list(APPEND _talus_kernels_whole_archive strata_mmq)
+  endif()
+  # Talus vision tower (C1): the tower's tk_vision_* exports must survive the static link
+  # (nothing in talus_kernels references them - the Rust host resolves them with dlsym), hence
+  # whole-archive.  A library built without the tower simply returns NULL from the Rust side's
+  # optional lookup, and the engine keeps refusing the pixel form as before.
+  if(TARGET strata_vision)
+    list(APPEND _talus_kernels_whole_archive strata_vision)
   endif()
   if(UNIX AND NOT APPLE)
     target_link_libraries(talus_kernels

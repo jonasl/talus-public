@@ -130,6 +130,13 @@ typedef struct tk_qwen4exp_rust_driver {
     // When non-null (default in pure-Rust mode; null under --cpp-engine / TALUS_FN_CPP=1), Rust owns the entire
     // prefill, token loop, and speculative verify/MTP decode loop.
     int (*run_generate_loop)(void* user_data, struct tk_qwen4exp_gen_ctx* ctx);
+
+    // The binary frame that followed the line next_line just returned (the `@raw` picture wire form: a GENI line
+    // is followed by the pictures' encoded bytes, read off stdin as one blob).  One slot: the bytes belong to the
+    // line just read, valid until the next next_line pops its pair; NULL + 0 when that line had no frame.  The
+    // pure-Rust loop reads line and frame together and never calls this; the C++ loop needs it to encode @raw
+    // pictures in-process.
+    const uint8_t* (*take_frame)(void* user_data, long* len_out);
 } tk_qwen4exp_rust_driver_t;
 
 typedef struct tk_qwen4exp_serve_ctx tk_qwen4exp_serve_ctx_t;

@@ -29,12 +29,15 @@ struct Opts {
     std::string mmproj, image, out;
     bool warm = true;
     bool cpu_oracle = false;
+    std::string emit_pixels;  // --emit-pixels <raw>: write the smart_resize'd RGB8 and stop (the bytes
+                              // a C1 server sends in the @px frame; the engine-side parity harness feeds them)
 };
 
 bool parse(int argc, char** argv, Opts& o) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--mmproj" && i + 1 < argc) o.mmproj = argv[++i];
+        else if (a == "--emit-pixels" && i + 1 < argc) o.emit_pixels = argv[++i];
         else if (a == "--warm") o.warm = true;
         else if (a == "--no-warm") o.warm = false;
         else if (a == "--cpu-oracle") o.cpu_oracle = true;
@@ -42,7 +45,7 @@ bool parse(int argc, char** argv, Opts& o) {
         else if (o.out.empty()) o.out = a;
         else return false;
     }
-    return !o.mmproj.empty() && !o.image.empty() && !o.out.empty();
+    return !o.mmproj.empty() && !o.image.empty() && (!o.out.empty() || !o.emit_pixels.empty());
 }
 
 void usage() {
@@ -79,6 +82,25 @@ int main(int argc, char** argv) {
     }
 
     std::string why;
+    if (!o.emit_pixels.empty()) {
+        strata_vit::ImageU8 src, resized;
+        strata_vit::PreparedImage prep;
+        if (!image_load_file(o.image, src, err) ||
+            !prepare_image(src, geo, geo.min_tokens, geo.max_tokens, prep, err, &resized)) {
+            std::fprintf(stderr, "selftest: emit-pixels: %s\n", err.c_str());
+            return 1;
+        }
+        FILE* f = std::fopen(o.emit_pixels.c_str(), "wb");
+        const bool ok = f && std::fwrite(resized.rgb.data(), 1, resized.rgb.size(), f) == resized.rgb.size();
+        if (f) std::fclose(f);
+        if (!ok) {
+            std::fprintf(stderr, "selftest: cannot write %s\n", o.emit_pixels.c_str());
+            return 1;
+        }
+        std::printf("selftest: emitted %ldx%ld = %zu bytes -> %s\n", (long) resized.w, (long) resized.h,
+                    resized.rgb.size(), o.emit_pixels.c_str());
+        return 0;
+    }
     if (!strata_vit::VitGpu::available(why)) {
         std::fprintf(stderr, "selftest: no GPU backend (%s)\n", why.c_str());
         return 3;

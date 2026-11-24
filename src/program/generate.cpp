@@ -1,6 +1,7 @@
 #include "qwen4exp_r2.hpp"   // qwen4exp-r2
 #include "strata/core/logit_bias.hpp"
 #include "talus_qwen4exp_kernels.h"
+#include "../vision/tk_vision.h"   // the in-process vision tower: @raw pictures encode here, not in strata-vision
 #include "qwen4exp_p4.hpp"   // qwen4exp-p4
 // src/program/generate.cpp - P2.S6: `strata generate`.
 //
@@ -1897,6 +1898,40 @@ static std::atomic<std::atomic<bool>*> g_qwen4exp_active_stop{nullptr};
 static bool rust_vision_optin() {
     const char* e = std::getenv("TALUS_FN_RUST_VISION");
     return e != nullptr && e[0] == '1';
+}
+
+// The native vision tower for the C++ serve loop (the @raw picture form): loaded on first use,
+// its width checked against the model's.  The tower lives in this library (src/vision/), so the
+// encode needs no transport at all - unlike the embeddings-file path, which waits on the external
+// strata-vision to have written the file.  No pressure-floor bump here: the C++ loop has never
+// had the #40 guard to bump.
+static tk_vision_t* g_vision_tower = nullptr;
+
+static bool vision_native_ensure(int64_t n_embd, std::string& err) {
+    if (g_vision_tower != nullptr) return true;
+    const char* mm = std::getenv("TALUS_VISION_MM");
+    if (mm == nullptr || *mm == '\0') {
+        err = "no mmproj: @raw pictures need TALUS_VISION_MM set to the tower's weights";
+        return false;
+    }
+    char terr[TK_VISION_ERRLEN] = {};
+    g_vision_tower = tk_vision_load(mm, 0, terr, sizeof terr);
+    if (g_vision_tower == nullptr) {
+        err = std::string("vision tower: ") + terr;
+        return false;
+    }
+    long info8[8];
+    const long dev = tk_vision_info(g_vision_tower, info8);
+    if (info8[0] != (long) n_embd) {
+        err = "the tower's width " + std::to_string(info8[0]) + " is not the model's " +
+              std::to_string((long long) n_embd);
+        tk_vision_destroy(g_vision_tower);
+        g_vision_tower = nullptr;
+        return false;
+    }
+    std::fprintf(stderr, "talus: native vision tower: width %ld, %ld MiB on device\n", info8[0],
+                 dev >> 20);
+    return true;
 }
 // ---- qwen4exp-p1 begin ----
 // Piece 1 runs in Rust when the Rust data plane is on (the driver owns the serve loop) and Rust registered its hooks.
@@ -12454,6 +12489,17 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                 std::fflush(stdout);
                 continue;
             }
+            if (line.rfind("VGEOM", 0) == 0) {   // the @raw geometry constants for the server's own predictor
+                std::string verr2;
+                if (!vision_native_ensure(g.n_embd, verr2)) std::printf("ERR VGEOM: %s\n", verr2.c_str());
+                else {
+                    long info8[8];
+                    tk_vision_info(g_vision_tower, info8);
+                    std::printf("VGEOM %ld %ld %ld\n", info8[5], info8[6], info8[7]);
+                }
+                std::fflush(stdout);
+                continue;
+            }
             // a command may touch the expert cache (a request lends slots, a K/V growth moves them, a session restore
             // quiesces it): a round of the asynchronous tier that the batch windows left in flight lands first
             if (!adapt_tick(true)) {
@@ -12789,6 +12835,9 @@ static int qwen4exp_engine_main(int argc, char** argv) {
             // in prompt order.  With them the conversation cache matches a picture by its key and grid, not by its
             // embedding floats, so a picture encoded again with other bits still matches.  Absent: the embeddings' hash.
             std::vector<uint64_t> req_img_keys;
+            // img_bytes=<n>,<n>,... (@raw): each picture's encoded byte length.  The frame behind
+            // the line is cut at these sums, so the tower learns where one picture's bytes end.
+            std::vector<uint64_t> req_img_lens;
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
                 for (;;) {
@@ -12829,6 +12878,18 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                             req_img_keys.push_back((uint64_t) v);
                             q = *qe == ',' ? qe + 1 : qe;
                             if (*qe != ',' && *qe != '\0') { req_img_keys.clear(); break; }
+                        }
+                    }
+                    else if (key == "img_bytes") {
+                        req_img_lens.clear();
+                        const char* q = tok.c_str() + eq + 1;
+                        while (*q != '\0') {
+                            char* qe = nullptr;
+                            const unsigned long long v = std::strtoull(q, &qe, 10);
+                            if (qe == q) { req_img_lens.clear(); break; }
+                            req_img_lens.push_back((uint64_t) v);
+                            q = *qe == ',' ? qe + 1 : qe;
+                            if (*qe != ',' && *qe != '\0') { req_img_lens.clear(); break; }
                         }
                     }
                     // unknown keys are skipped: the ids start at the first token without '='
@@ -12894,6 +12955,47 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                     struct Img { int64_t n, nx, ny; size_t off; };
                     std::vector<Img> imgs;
                     img_rows.clear();
+                    if (emb_path == "@raw") {
+                        // The tower decodes and resizes the encoded bytes itself (stb inside the
+                        // tower), so nothing upstream has to agree on a size; the bytes rode in on
+                        // stdin behind the line (the Rust stdin reader owns them, take_frame hands
+                        // them over) and img_bytes= says where each picture's slice ends.
+                        std::string ferr;
+                        if (!vision_native_ensure(g.n_embd, ferr)) ve = ferr;
+                        else if (req_img_lens.empty()) ve = "@raw needs img_bytes=<bytes per picture>";
+                        else if (g_qwen4exp_rust_driver == nullptr ||
+                                 g_qwen4exp_rust_driver->take_frame == nullptr)
+                            ve = "@raw needs the Rust stdin reader (it owns the frame bytes)";
+                        const uint8_t* frame = nullptr;
+                        long flen = 0;
+                        if (ve.empty()) {
+                            frame = g_qwen4exp_rust_driver->take_frame(
+                                g_qwen4exp_rust_driver->user_data, &flen);
+                            if (frame == nullptr || flen <= 0) ve = "@raw with no frame bytes behind the line";
+                        }
+                        int64_t used = 0;
+                        for (size_t k = 0; ve.empty() && k < req_img_lens.size(); ++k) {
+                            const long len = (long) req_img_lens[k];
+                            const float* rows = nullptr;
+                            long nf = 0, nx = 0, ny = 0;
+                            char terr[TK_VISION_ERRLEN] = {};
+                            const long n = tk_vision_encode_raw(g_vision_tower, frame + used, len,
+                                                                 &rows, &nf, &nx, &ny, terr,
+                                                                 sizeof terr);
+                            used += len;
+                            if (n < 1) {
+                                ve = "@raw picture " + std::to_string(k + 1) + ": " + terr;
+                                break;
+                            }
+                            const size_t off = img_rows.size(), cnt = (size_t) nf;
+                            img_rows.resize(off + cnt);
+                            std::memcpy(img_rows.data() + off, rows, cnt * sizeof(float));   // the tower's scratch ends at the next encode_raw
+                            imgs.push_back({(int64_t) n, (int64_t) nx, (int64_t) ny, off});
+                        }
+                        if (ve.empty() && used != flen)
+                            ve = "@raw frame is " + std::to_string(flen) + " B but img_bytes sums to " +
+                                 std::to_string(used);
+                    } else {
                     std::FILE* f = std::fopen(emb_path.c_str(), "rb");
                     if (!f) ve = "cannot open " + emb_path;
                     while (f && ve.empty()) {
@@ -12912,6 +13014,7 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                         imgs.push_back({hdr[1], hdr[2], hdr[3], off});
                     }
                     if (f) std::fclose(f);
+                    }
                     int64_t p = 0, i = 0;
                     size_t k = 0;
                     while (ve.empty() && i < n) {

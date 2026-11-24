@@ -21,11 +21,10 @@ pub const DROPPED_FEATURES: &[(&str, &str)] = &[
 
 /// Explicitly deferred features (WP-1.4):
 /// - MCP hub (`serve/mcphub.py`)
-/// - Vision / multimodal (`serve/vision.py`)
-pub const DEFERRED_FEATURES: &[(&str, &str)] = &[
-    ("mcp_hub", "Model Context Protocol (MCP) tool server hub"),
-    ("vision", "Multimodal image input and vision projector"),
-];
+///
+/// (Vision / multimodal landed: `vision.rs` drives `strata-vision` and GENI, run config `"vision"`.)
+pub const DEFERRED_FEATURES: &[(&str, &str)] =
+    &[("mcp_hub", "Model Context Protocol (MCP) tool server hub")];
 
 /// Default cap on simultaneous HTTP connections. The engine runs one sequence at a time; this bounds the threads and
 /// buffers that waiting clients (agents with parallel tool calls, the TUI, health checks) can hold.
@@ -88,6 +87,10 @@ pub struct ServerConfig {
     pub engine_args: Vec<String>,
     pub engine_env: Vec<(String, String)>,
     pub lib_dirs: Vec<String>,
+    /// Vision / multimodal (run config `"vision"`, `vision.rs`): drives Strata's `strata-vision`
+    /// encoder as a subprocess and feeds the engine GENI embeddings. `None` keeps the
+    /// `image_url`-part 400 refusal; `Some` also adds `--vision` to `engine_args` when absent.
+    pub vision: Option<crate::vision::VisionConfig>,
     /// talus-tui control directory (`--control-dir`): per-model run configs `<model-id>.json` and the generated
     /// `active.json`. `None` turns the control endpoint (`POST /v1/talus/apply`) off.
     pub control_dir: Option<PathBuf>,
@@ -144,6 +147,7 @@ impl Default for ServerConfig {
             engine_args: Vec::new(),
             engine_env: Vec::new(),
             lib_dirs: Vec::new(),
+            vision: None,
             control_dir: None,
             raw_config: JsonValue::empty_obj(),
         }
@@ -552,6 +556,16 @@ impl ServerConfig {
                         i += 1;
                     }
                 }
+            }
+        }
+
+        // The optional "vision" block (option B, vision.rs): the strata-vision encoder subprocess.
+        // Present = the engine must take GENI requests, so `--vision` joins the args unless the
+        // config already carries it (mirrors serve/server.py adding --vision for its Vision class).
+        if let Some(vb) = val.get("vision") {
+            cfg.vision = Some(crate::vision::VisionConfig::from_json(vb)?);
+            if !cfg.engine_args.iter().any(|a| a == "--vision") {
+                cfg.engine_args.push("--vision".to_string());
             }
         }
 

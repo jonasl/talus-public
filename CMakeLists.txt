@@ -639,6 +639,28 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     endif()
   endif()
 
+  # Talus vision tower: the Strata `own/` vision tower relocated verbatim - a
+  # standalone tree with zero engine coupling by design (stb_image vendored to
+  # third_party/stb, same as Strata's).  Kept OUT of libtalus_kernels for now:
+  # the selftest host must first prove compile, hipBLAS coexistence with the
+  # LLM loaded, and record parity vs strata-vision-hip.
+  if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/vision/vit_gpu.cu")
+    add_library(strata_vision STATIC
+      src/vision/gguf_lite.cpp src/vision/vit_geometry.cpp src/vision/image_prep.cpp
+      src/vision/vit_ref.cpp src/vision/vit_gpu.cu)
+    target_include_directories(strata_vision PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/vision)
+    target_include_directories(strata_vision PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
+    target_compile_features(strata_vision PUBLIC cxx_std_17)
+    target_link_libraries(strata_vision PUBLIC ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target} Threads::Threads)
+    if(STRATA_ENABLE_HIP)
+      target_compile_definitions(strata_vision PUBLIC STRATA_VIT_GPU STRATA_VIT_HIP)
+    else()
+      target_compile_definitions(strata_vision PUBLIC STRATA_VIT_GPU STRATA_VIT_CUDA)
+    endif()
+    add_executable(talus-vision-selftest src/vision/selftest.cpp)
+    target_link_libraries(talus-vision-selftest PRIVATE strata_vision)
+  endif()
+
   if(STRATA_ENABLE_HIP AND STRATA_PREFILL_MMQ)
     # Talus: parity / timing of the Talus prefill kernels against the kernels they replace
     # (src/program/qwen4exp_r2v.cpp: libstrata_engine.a's mtp.cpp calls into it since qwen4exp-r2v)

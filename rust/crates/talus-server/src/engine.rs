@@ -8,7 +8,8 @@ use std::fmt;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -612,6 +613,9 @@ pub struct ScriptedMockEngine {
     /// E6 tests: advertise json_schema support, and the last schema a request carried.
     json_schema_ok: AtomicBool,
     last_json_schema: Mutex<Option<String>>,
+    /// Batch mode (`--batch` on the mock): the engine-side protocol responder, and the bus the
+    /// admission/pump machinery reads - the same client code path the real engine uses.
+    batch: Mutex<Option<Arc<MockBatch>>>,
 }
 
 /// The mock's deterministic logprobs for generated step `step` (0-based) choosing `tok`: the token is the top-1.
@@ -683,6 +687,7 @@ impl ScriptedMockEngine {
             score_on: AtomicBool::new(false),
             json_schema_ok: AtomicBool::new(false),
             last_json_schema: Mutex::new(None),
+            batch: Mutex::new(None),
         }
     }
 
@@ -1022,6 +1027,272 @@ impl ScriptedMockEngine {
     }
 }
 
+/// The mock's batch mode: a responder thread that speaks the engine side of the slot protocol
+/// (`BGEN` answered on the control lines, the slot's own `BT`/`BDONE` window, `BSTOP` ending a
+/// slot at its next line), and the bus the machinery reads - so a mock-hosted request runs
+/// through the very admission/pump code the stdio engine uses.
+pub(crate) struct MockBatch {
+    pub(crate) bus: Arc<EngineBus>,
+    feeder: Arc<BusFeeder>,
+    tx: mpsc::Sender<String>,
+    scripts: Arc<Mutex<std::collections::VecDeque<Vec<u32>>>>,
+    pace_ms: Arc<AtomicU64>,
+    refusals: Arc<AtomicUsize>,
+    stopped: Arc<Mutex<std::collections::HashSet<usize>>>,
+    /// Concurrent requests serialize on their admission, exactly as the real server's control
+    /// handoff does: one `BGEN` answered on the control lines at a time.
+    admit_lock: Arc<Mutex<()>>,
+}
+
+impl ScriptedMockEngine {
+    /// Put the mock in batch mode with `n` engine slots (idempotent). Scripts set afterwards are
+    /// served one per `BGEN`.
+    pub fn set_batch_slots(&self, n: usize) {
+        let mut slot = self.batch.lock().unwrap();
+        if slot.is_some() {
+            return;
+        }
+        let (bus, feeder) = EngineBus::manual(n);
+        let (tx, rx) = mpsc::channel();
+        let shared = Arc::new(MockBatch {
+            bus,
+            feeder: Arc::new(feeder),
+            tx,
+            scripts: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            pace_ms: Arc::new(AtomicU64::new(0)),
+            refusals: Arc::new(AtomicUsize::new(0)),
+            stopped: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            admit_lock: Arc::new(Mutex::new(())),
+        });
+        let responder = shared.clone();
+        thread::spawn(move || mock_batch_responder(rx, responder));
+        *slot = Some(shared);
+    }
+
+    /// The token scripts the batch responder serves, one per `BGEN`.
+    pub fn set_batch_scripts(&self, scripts: Vec<Vec<u32>>) {
+        let Some(b) = self.batch.lock().unwrap().clone() else {
+            return;
+        };
+        let mut q = b.scripts.lock().unwrap();
+        q.clear();
+        q.extend(scripts);
+    }
+
+    /// Pause between a slot's `BT` lines, so a test can `BSTOP` a running one.
+    pub fn set_batch_pace_ms(&self, ms: u64) {
+        if let Some(b) = self.batch.lock().unwrap().clone() {
+            b.pace_ms.store(ms, Ordering::Relaxed);
+        }
+    }
+
+    /// The next `n` BGENs are refused (`ERR BGEN:`), exercising the park-and-retry path.
+    pub fn seed_batch_refusals(&self, n: usize) {
+        if let Some(b) = self.batch.lock().unwrap().clone() {
+            b.refusals.store(n, Ordering::Relaxed);
+        }
+    }
+
+    /// The mock's batch bus, for assertions about slot state.
+    #[allow(dead_code)] // the cfg(test) slot tests are its only callers so far
+    pub(crate) fn batch_bus(&self) -> Option<Arc<EngineBus>> {
+        self.batch.lock().unwrap().as_ref().map(|b| b.bus.clone())
+    }
+
+    /// One request through the slot protocol: admit, then read the slot to its `BDONE`. The
+    /// stop-token conventions match the solo path: the stop token is suppressed (the engine does
+    /// emit it as a `BT`, and the slot ends there - the machinery then waits for the `BDONE`
+    /// that follows in the same window, their #1869).
+    fn generate_via_batch(
+        &self,
+        b: Arc<MockBatch>,
+        req: &GenerateRequest,
+        cancel: &Arc<AtomicBool>,
+        on_token: &mut dyn FnMut(u32, Option<TokenLogprob>) -> bool,
+        on_progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<EngineTimings, EngineError> {
+        self.load()?;
+        let keys = req.sampling.to_gen_keys();
+        let csv = req
+            .prompt_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sink = crate::batch::ScriptSink(b.tx.clone());
+        let client = crate::batch::BatchClient {
+            bus: &b.bus,
+            sink: &sink,
+        };
+        let cmd = |slot: usize| format!("BGEN {slot} {}{} {}", req.max_new_tokens, keys, csv);
+        let is_stop = |t: u32| self.tok.is_stop_token(t) || req.stop_tokens.contains(&t);
+        let leg = {
+            let _admit = b.admit_lock.lock().unwrap();
+            client.admit(
+                &cmd,
+                None,
+                &req.prompt_ids,
+                cancel,
+                &mut |t, lp| {
+                    if is_stop(t) && !req.sampling.ignore_eos {
+                        false
+                    } else {
+                        on_token(t, lp)
+                    }
+                },
+                on_progress,
+            )?
+        };
+        if leg.cancelled {
+            // The consumer left during admission: the machinery already `BSTOP`ped the slot (if
+            // it continued) and handed its lines to the router. Nothing left to read.
+            return Ok(EngineTimings {
+                cache_n: leg.reused,
+                prompt_n: leg.prompt_n,
+                prompt_ms: leg.prompt_ms,
+                predicted_n: 0,
+                predicted_ms: 0.5,
+                draft_n: None,
+                draft_accepted: None,
+                finish_reason: if leg.finish == "stop" {
+                    "stop".to_string()
+                } else {
+                    "cancel".to_string()
+                },
+            });
+        }
+        if !leg.cont {
+            // The admission consumed the whole leg. Its token rides `on_token` already - either
+            // yielded, or suppressed as a stop token, which then does not count as predicted.
+            return Ok(EngineTimings {
+                cache_n: leg.reused,
+                prompt_n: leg.prompt_n,
+                prompt_ms: leg.prompt_ms,
+                predicted_n: leg
+                    .admission
+                    .into_iter()
+                    .count()
+                    .saturating_sub(if leg.finish == "stop" { 1 } else { 0 }),
+                predicted_ms: 0.5,
+                draft_n: None,
+                draft_accepted: None,
+                finish_reason: if leg.finish.is_empty() {
+                    "length".to_string()
+                } else {
+                    leg.finish
+                },
+            });
+        }
+        let emitted: Vec<u32> = leg.admission.into_iter().collect();
+        let res = client.pump(leg.slot, &req.prompt_ids, &emitted, cancel, &mut |t| {
+            if is_stop(t) && !req.sampling.ignore_eos {
+                false // suppressed, as the solo path suppresses it: the slot ends here
+            } else {
+                on_token(t, None)
+            }
+        })?;
+        // The engine's `produced` counts the stop token the solo path suppresses (their #1869's
+        // slot end is that same token); a cancelled leg absorbs its last tokens unreported.
+        let suppressed = match res.finish.as_str() {
+            "stop" | "abort" => 1,
+            _ => 0,
+        };
+        Ok(EngineTimings {
+            cache_n: leg.reused,
+            prompt_n: leg.prompt_n,
+            prompt_ms: leg.prompt_ms,
+            predicted_n: res.produced.saturating_sub(suppressed),
+            predicted_ms: res.decode_ms.max(0.5),
+            draft_n: None,
+            draft_accepted: None,
+            finish_reason: if res.finish == "abort" {
+                "stop".to_string()
+            } else {
+                res.finish
+            },
+        })
+    }
+}
+
+/// The mock's engine side of the slot protocol; see [`MockBatch`]. One thread reads commands, and
+/// one per admitted slot plays out its `BT` window at the configured pace, ending at a stop token,
+/// `max_new`, or a `BSTOP` - and always with its `BDONE`, as the engine does.
+fn mock_batch_responder(rx: mpsc::Receiver<String>, b: Arc<MockBatch>) {
+    let feeder = b.feeder.clone();
+    while let Ok(cmd) = rx.recv() {
+        let mut w = cmd.split_whitespace();
+        match w.next().unwrap_or("") {
+            "BGEN" | "BGENI" => {
+                let slot = w.next().and_then(|x| x.parse::<usize>().ok()).unwrap_or(0);
+                // The sampling keys start with a space, so `max_new` is its own word here.
+                let max_new: usize = w.next().and_then(|x| x.parse().ok()).unwrap_or(usize::MAX);
+                if b.refusals.load(Ordering::SeqCst) > 0 {
+                    b.refusals.fetch_sub(1, Ordering::SeqCst);
+                    feeder.push("ERR BGEN: no such free slot (--batch 2) or a bad max_new");
+                    continue;
+                }
+                let toks = b
+                    .scripts
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_else(|| vec![ID_IM_END]);
+                let plen = 8usize;
+                feeder.push(format!("PP {plen} {plen} 1.0"));
+                feeder.push(format!("T {}", toks.first().copied().unwrap_or(ID_IM_END)));
+                let admitted_stop = toks.first() == Some(&ID_IM_END);
+                if toks.len() <= 1 || max_new <= 1 {
+                    // The prompt's read spent everything: the leg is done on the control lines.
+                    let fin = if admitted_stop { "stop" } else { "length" };
+                    feeder.push(format!("DONE 1 {plen} 1.0 0.5 {fin} 0 0 0 0 0 0 0 0.0 0 0"));
+                    feeder.push(format!("BADM {slot} 0"));
+                    continue;
+                }
+                feeder.push(format!(
+                    "DONE 1 {plen} 1.0 0.5 length 0 0 0 0 0 0 0 0.0 0 0"
+                ));
+                feeder.push(format!("BADM {slot} 1"));
+                let (feeder2, pace, stopped) =
+                    (feeder.clone(), b.pace_ms.clone(), b.stopped.clone());
+                thread::spawn(move || {
+                    let mut produced = 1usize; // the engine's BDONE counts the admission's token
+                    let mut fin = "length";
+                    for &t in &toks[1..] {
+                        if produced >= max_new {
+                            break;
+                        }
+                        let ms = pace.load(Ordering::Relaxed);
+                        if ms > 0 {
+                            thread::sleep(Duration::from_millis(ms));
+                        }
+                        if stopped.lock().unwrap().remove(&slot) {
+                            fin = "cancel";
+                            break;
+                        }
+                        feeder2.push(format!("BT {slot} {t}"));
+                        produced += 1;
+                        if t == ID_IM_END {
+                            fin = "stop";
+                            break;
+                        }
+                    }
+                    feeder2.push(format!("BDONE {slot} {produced} {fin} 1.0"));
+                    // A BSTOP that landed after the window ends must not poison the next tenant.
+                    stopped.lock().unwrap().remove(&slot);
+                });
+            }
+            "BSTOP" => {
+                if let Some(s) = w.next().and_then(|x| x.parse::<usize>().ok()) {
+                    b.stopped.lock().unwrap().insert(s);
+                }
+            }
+            // STOP (an admission's cancel) and anything else: the mock's legs answer inline, so
+            // there is nothing mid-decode to stop on the control lines.
+            _ => {}
+        }
+    }
+}
+
 impl Engine for ScriptedMockEngine {
     fn max_context(&self) -> usize {
         self.max_context.load(Ordering::Relaxed)
@@ -1102,6 +1373,9 @@ impl Engine for ScriptedMockEngine {
         on_token: &mut dyn FnMut(u32, Option<TokenLogprob>) -> bool,
         on_progress: &mut dyn FnMut(usize, usize),
     ) -> Result<EngineTimings, EngineError> {
+        if let Some(b) = self.batch.lock().unwrap().clone() {
+            return self.generate_via_batch(b, req, &cancel, on_token, on_progress);
+        }
         let lp_k = req
             .sampling
             .logprobs
@@ -1338,24 +1612,81 @@ fn parse_score_cmd(line: &str) -> Result<ScoreRequest, String> {
 /// the pipe itself (the mirror image of the engine's own stdin reader thread). `ended` poisons the
 /// bus: `recv` still yields any buffered line and only then reports the close, which is how a
 /// request reading a real pipe sees it - remaining output first, EOF last.
-struct EngineBus {
-    lines: Mutex<std::collections::VecDeque<String>>,
+/// A line from the engine, or the end of the stream: what the bus receives deliver. The timed
+/// variants add `TimedOut` so a caller can poll its own state meanwhile (a client that left, a
+/// slot to steal back).
+#[derive(Debug)]
+pub(crate) enum BusLine {
+    Line(String),
+    Ended,
+    TimedOut,
+}
+
+/// One engine slot's admission state as this server sees it - the Rust shape of
+/// `serve/server.py`'s `slot_busy`/`slot_claims`/`slot_releasing`/`slot_held` bookkeeping, where a
+/// busy flag with no owner is a leak and gets reaped (their issue #1603).
+struct SlotState {
+    busy: bool,
+    /// A request owns this slot, through an admission or a slot pump.
+    claimed: bool,
+    /// Its consumer left: the router eats the slot's remaining lines and frees the slot at its
+    /// BDONE - the inline version of the Python client's background BDONE wait.
+    releasing: bool,
+    /// What the releasing bookkeeping runs on: the conversation the consumer left (prompt + what
+    /// it saw), and the `BT` tokens the engine fed after that. At BDONE the slot holds all of it
+    /// but the last token.
+    held_stream: Vec<u32>,
+    tail: Vec<u32>,
+    /// Their #1994: the engine refused a BGEN here; the slot stays out of the picks, busy and
+    /// ownerless, until the park ages out.
+    park_until: Option<Instant>,
+    /// Their #1603: since when this busy flag has had no owner.
+    orphan_since: Option<Instant>,
+    /// What the slot's conversation holds: the prompt and every token fed, all but the last.
+    held: Vec<u32>,
+}
+
+struct BusInner {
+    ctl: std::collections::VecDeque<String>,
+    /// Per-slot queues and state, `nslots` long (empty when the engine runs no batch slots).
+    q: Vec<std::collections::VecDeque<String>>,
+    slot: Vec<SlotState>,
+    nslots: usize,
+    ended: bool,
+}
+
+/// Every engine line after `READY` reaches its consumer through here: a dedicated reader thread
+/// drains stdout so a request takes engine output off a queue instead of blocking on the pipe
+/// itself (the mirror image of the engine's own stdin reader thread). The thread also ROUTES: `BT`
+/// and `BDONE` lines go to their batch slot's own queue - or, when a slot is releasing, are
+/// swallowed right here to finish its conversation bookkeeping - and everything else to the
+/// control queue. EOF poisons every queue: each drains first and only then reports the close,
+/// which is how a request reading a real pipe sees it - remaining output first, EOF last.
+pub(crate) struct EngineBus {
+    inner: Mutex<BusInner>,
     signal: std::sync::Condvar,
-    ended: AtomicBool,
-    /// The stdout read error that ended the stream, if it was not a clean EOF; `recv` hands it to
-    /// the next consumer, the way an inline read would have raised it.
+    /// The stdout read error that ended the stream, if it was not a clean EOF; a receive hands it
+    /// to the next consumer, the way an inline read would have raised it.
     read_err: Mutex<Option<String>>,
+    orphan_slot_ns: AtomicU64,
+    slot_park_ns: AtomicU64,
+}
+
+/// Which queue a receive reads: the engine's control lines, or one batch slot's own lines.
+#[derive(Clone, Copy)]
+enum Sel {
+    Ctl,
+    Slot(usize),
 }
 
 impl EngineBus {
     /// Start the thread that owns the engine's stdout; it feeds the returned bus until EOF.
-    fn spawn<R: std::io::Read + Send + 'static>(reader: BufReader<R>) -> Arc<EngineBus> {
-        let bus = Arc::new(EngineBus {
-            lines: Mutex::new(std::collections::VecDeque::new()),
-            signal: std::sync::Condvar::new(),
-            ended: AtomicBool::new(false),
-            read_err: Mutex::new(None),
-        });
+    /// `nslots` is the engine's `INFO batch_slots`: with none, every line is a control line.
+    pub(crate) fn spawn<R: std::io::Read + Send + 'static>(
+        reader: BufReader<R>,
+        nslots: usize,
+    ) -> Arc<EngineBus> {
+        let bus = Arc::new(EngineBus::new(nslots));
         let feeding = Arc::clone(&bus);
         let result = thread::Builder::new()
             .name("talus-engine-stdout".to_string())
@@ -1364,52 +1695,362 @@ impl EngineBus {
                 let mut line = String::new();
                 loop {
                     line.clear();
+                    // No bound: the engine prints only while a request runs, and a consumer that
+                    // vanished takes the process down with its `quit_and_wait`.
                     match reader.read_line(&mut line) {
                         Ok(0) => break,
-                        Ok(_) => {
-                            let taken = std::mem::take(&mut line);
-                            // No bound: the engine prints only while a request runs, and a consumer
-                            // that vanished takes the process down with its `quit_and_wait`.
-                            feeding.lines.lock().unwrap().push_back(taken);
-                            feeding.signal.notify_one();
-                        }
+                        Ok(_) => feeding.route(std::mem::take(&mut line)),
                         Err(e) => {
                             *feeding.read_err.lock().unwrap() = Some(format!("{e}"));
                             break;
                         }
                     }
                 }
-                feeding.ended.store(true, Ordering::SeqCst);
-                feeding.signal.notify_all();
+                feeding.close();
             });
-        match result {
-            Ok(_) => bus,
-            Err(e) => {
-                *bus.read_err.lock().unwrap() = Some(format!("stdout reader thread: {e}"));
-                bus.ended.store(true, Ordering::SeqCst);
-                bus
-            }
+        if let Err(e) = result {
+            *bus.read_err.lock().unwrap() = Some(format!("stdout reader thread: {e}"));
+            bus.close();
+        }
+        bus
+    }
+
+    /// A bus fed by hand - what the mock engine's scripted responder and the bus tests use where
+    /// a pipe would be.
+    pub(crate) fn manual(nslots: usize) -> (Arc<EngineBus>, BusFeeder) {
+        let bus = Arc::new(EngineBus::new(nslots));
+        let feeder = BusFeeder {
+            bus: Arc::clone(&bus),
+        };
+        (bus, feeder)
+    }
+
+    fn new(nslots: usize) -> EngineBus {
+        EngineBus {
+            inner: Mutex::new(BusInner {
+                ctl: std::collections::VecDeque::new(),
+                q: (0..nslots).map(|_| Default::default()).collect(),
+                slot: (0..nslots)
+                    .map(|_| SlotState {
+                        busy: false,
+                        claimed: false,
+                        releasing: false,
+                        held_stream: Vec::new(),
+                        tail: Vec::new(),
+                        park_until: None,
+                        orphan_since: None,
+                        held: Vec::new(),
+                    })
+                    .collect(),
+                nslots,
+                ended: false,
+            }),
+            signal: std::sync::Condvar::new(),
+            read_err: Mutex::new(None),
+            orphan_slot_ns: AtomicU64::new(Duration::from_secs(3).as_nanos() as u64),
+            slot_park_ns: AtomicU64::new(Duration::from_secs(2).as_nanos() as u64),
         }
     }
 
-    /// The next engine line, waiting while none has arrived. `Ok(None)` means stdout hit EOF and
-    /// the queue drained - the engine is gone or going.
-    fn recv(&self) -> Result<Option<String>, EngineError> {
-        let mut q = self.lines.lock().unwrap();
-        loop {
-            if let Some(line) = q.pop_front() {
-                return Ok(Some(line));
+    /// Shorten the park and the reap (tests, so neither sleeps seconds; their Python original
+    /// paces the same clock).
+    #[allow(dead_code)] // the cfg(test) slot tests are its only callers so far
+    pub(crate) fn set_slot_knobs(&self, orphan: Duration, park: Duration) {
+        self.orphan_slot_ns
+            .store(orphan.as_nanos() as u64, Ordering::Relaxed);
+        self.slot_park_ns
+            .store(park.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// Deliver one engine line to its queue, swallowing the releasing slots' own lines.
+    fn route(&self, line: String) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.nslots > 0 {
+            let head = line.split_whitespace().next().unwrap_or("");
+            if head == "BT" || head == "BDONE" {
+                if let Some(s) = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|x| x.parse::<usize>().ok())
+                {
+                    if s < inner.nslots {
+                        if inner.slot[s].releasing {
+                            if head == "BT" {
+                                if let Some(t) = line
+                                    .split_whitespace()
+                                    .nth(2)
+                                    .and_then(|x| x.parse::<u32>().ok())
+                                {
+                                    inner.slot[s].tail.push(t);
+                                }
+                            } else {
+                                let nonfinite = line
+                                    .split_whitespace()
+                                    .nth(3)
+                                    .is_some_and(|f| f == "nonfinite");
+                                Self::finish_release(&mut inner, s, nonfinite);
+                            }
+                        } else {
+                            inner.q[s].push_back(line);
+                        }
+                        self.signal.notify_all();
+                        return;
+                    }
+                }
             }
-            if self.ended.load(Ordering::SeqCst) {
+        }
+        inner.ctl.push_back(line);
+        self.signal.notify_all();
+    }
+
+    /// A releasing slot reached its BDONE: the slot now holds the left conversation and every
+    /// token after it, but the last one (the engine's cache keeps a prompt plus all but the final
+    /// token); a `nonfinite` BDONE dropped it all (their #879).
+    fn finish_release(inner: &mut BusInner, s: usize, nonfinite: bool) {
+        let st = &mut inner.slot[s];
+        let mut all = std::mem::take(&mut st.held_stream);
+        let keep = !all.is_empty() && !nonfinite;
+        all.extend(std::mem::take(&mut st.tail));
+        if keep && all.len() > 1 {
+            all.truncate(all.len() - 1);
+        } else {
+            all.clear();
+        }
+        st.held = all;
+        st.releasing = false;
+        st.busy = false;
+        st.claimed = false;
+    }
+
+    fn pop_sel(inner: &mut BusInner, sel: Sel) -> Option<String> {
+        match sel {
+            Sel::Ctl => inner.ctl.pop_front(),
+            Sel::Slot(s) if s < inner.nslots => inner.q[s].pop_front(),
+            Sel::Slot(_) => None,
+        }
+    }
+
+    fn recv_from(&self, sel: Sel, timeout: Option<Duration>) -> Result<BusLine, EngineError> {
+        let mut guard = self.inner.lock().unwrap();
+        let deadline = timeout.map(|d| Instant::now() + d);
+        loop {
+            if let Some(line) = Self::pop_sel(&mut guard, sel) {
+                return Ok(BusLine::Line(line));
+            }
+            if guard.ended {
                 return match self.read_err.lock().unwrap().as_ref() {
                     Some(e) => Err(EngineError::EngineDied(format!(
                         "engine stdout read failed: {e}"
                     ))),
-                    None => Ok(None),
+                    None => Ok(BusLine::Ended),
                 };
             }
-            q = self.signal.wait(q).unwrap();
+            guard = match deadline {
+                Some(dl) => {
+                    let now = Instant::now();
+                    if now >= dl {
+                        return Ok(BusLine::TimedOut);
+                    }
+                    self.signal.wait_timeout(guard, dl - now).unwrap().0
+                }
+                None => self.signal.wait(guard).unwrap(),
+            };
         }
+    }
+
+    /// The next control line, `TimedOut` after `None` of waiting (`None`: wait as long as it takes).
+    pub(crate) fn recv_ctl(&self, timeout: Option<Duration>) -> Result<BusLine, EngineError> {
+        self.recv_from(Sel::Ctl, timeout)
+    }
+
+    /// One slot's next line: `BT`/`BDONE` the router kept for it, waiting up to `timeout`.
+    pub(crate) fn recv_slot(&self, slot: usize, timeout: Duration) -> Result<BusLine, EngineError> {
+        self.recv_from(Sel::Slot(slot), Some(timeout))
+    }
+
+    /// The next engine line, waiting while none has arrived. `Ok(None)` means stdout hit EOF and
+    /// the queue drained - the engine is gone or going.
+    pub(crate) fn recv(&self) -> Result<Option<String>, EngineError> {
+        match self.recv_ctl(None)? {
+            BusLine::Line(l) => Ok(Some(l)),
+            BusLine::Ended => Ok(None),
+            BusLine::TimedOut => unreachable!("an unbounded receive cannot time out"),
+        }
+    }
+
+    /// Stdout closed: every queue reports `Ended` once it drained.
+    fn close(&self) {
+        self.inner.lock().unwrap().ended = true;
+        self.signal.notify_all();
+    }
+
+    /// Empty one slot's queue - required before a `BGEN`, or the new request reads the lines its
+    /// predecessor left behind.
+    pub(crate) fn drain_slot(&self, slot: usize) {
+        let mut guard = self.inner.lock().unwrap();
+        if slot < guard.nslots {
+            guard.q[slot].clear();
+        }
+    }
+
+    /// The first free slot, claimed; `None` when all are busy. Frees on its way any parked
+    /// refusal that aged out and any busy flag whose owner leaked - their #1603 gives such a flag
+    /// `orphan_slot` of looking ownerless first, so a slot set moments before its owner registers
+    /// is never taken.
+    pub(crate) fn claim_free_slot(&self) -> Option<usize> {
+        let mut guard = self.inner.lock().unwrap();
+        let now = Instant::now();
+        let orphan = Duration::from_nanos(self.orphan_slot_ns.load(Ordering::Relaxed));
+        for st in guard.slot.iter_mut() {
+            if let Some(d) = st.park_until {
+                if now >= d {
+                    st.park_until = None;
+                    if !st.claimed && !st.releasing {
+                        st.busy = false;
+                    }
+                }
+            }
+        }
+        for (s, st) in guard.slot.iter_mut().enumerate() {
+            if !st.busy {
+                st.busy = true;
+                st.claimed = true;
+                st.orphan_since = None;
+                return Some(s);
+            }
+        }
+        for (s, st) in guard.slot.iter_mut().enumerate() {
+            if st.busy && !st.claimed && !st.releasing && st.park_until.is_none() {
+                match st.orphan_since {
+                    None => st.orphan_since = Some(now),
+                    Some(t) if now.duration_since(t) >= orphan => {
+                        eprintln!(
+                            "[talus-server] parallel: slot {s} was marked busy with no request \
+                             using it; freed (issue #1603)"
+                        );
+                        st.busy = false;
+                        st.orphan_since = None;
+                        self.signal.notify_all();
+                        return Some(s);
+                    }
+                    _ => {}
+                }
+            } else {
+                st.orphan_since = None;
+            }
+        }
+        None
+    }
+
+    /// Sleep up to `timeout` for a slot to come free (the claim loop's wait; the claim re-runs on
+    /// wake and on deadline).
+    pub(crate) fn wait_slot(&self, timeout: Duration) {
+        let guard = self.inner.lock().unwrap();
+        let _ = self.signal.wait_timeout(guard, timeout);
+    }
+
+    /// The engine refused a BGEN (their #1994): keep the slot busy with no owner until the park
+    /// ages out; the engine's view of it needs the moment to catch up.
+    pub(crate) fn unclaim_park(&self, slot: usize) {
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(st) = guard.slot.get_mut(slot) {
+            st.claimed = false;
+            st.busy = true;
+            st.park_until = Some(
+                Instant::now() + Duration::from_nanos(self.slot_park_ns.load(Ordering::Relaxed)),
+            );
+            st.orphan_since = None;
+        }
+    }
+
+    /// A slot whose BDONE its own request read: free, holding `held`.
+    pub(crate) fn release_done(&self, slot: usize, held: Vec<u32>) {
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(st) = guard.slot.get_mut(slot) {
+            st.busy = false;
+            st.claimed = false;
+            st.releasing = false;
+            st.park_until = None;
+            st.orphan_since = None;
+            st.held_stream.clear();
+            st.tail.clear();
+            st.held = held;
+        }
+        self.signal.notify_all();
+    }
+
+    /// A slot's consumer left (its `BSTOP` is the caller's to send): take over the bookkeeping.
+    /// Any of its lines still queued are consumed here - with its BDONE among them the slot is
+    /// free on the spot (`true`); otherwise the router frees it at the BDONE still to come.
+    pub(crate) fn begin_release(&self, slot: usize, stream: Vec<u32>) -> bool {
+        let mut guard = self.inner.lock().unwrap();
+        if slot >= guard.nslots {
+            return true;
+        }
+        let st = &mut guard.slot[slot];
+        st.claimed = false;
+        st.releasing = true;
+        st.held_stream = stream;
+        let mut done = None;
+        while let Some(line) = guard.q[slot].pop_front() {
+            let head = line.split_whitespace().next().unwrap_or("");
+            if head == "BT" {
+                if let Some(t) = line
+                    .split_whitespace()
+                    .nth(2)
+                    .and_then(|x| x.parse::<u32>().ok())
+                {
+                    guard.slot[slot].tail.push(t);
+                }
+            } else if head == "BDONE" {
+                done = Some(
+                    line.split_whitespace()
+                        .nth(3)
+                        .is_some_and(|f| f == "nonfinite"),
+                );
+            }
+        }
+        match done {
+            Some(nonfinite) => {
+                Self::finish_release(&mut guard, slot, nonfinite);
+                self.signal.notify_all();
+                true
+            }
+            None => {
+                self.signal.notify_all();
+                false
+            }
+        }
+    }
+
+    /// What a slot's conversation holds, for the next turn's slot pick.
+    #[allow(dead_code)] // the cfg(test) slot tests use it; stage-3's pick will too
+    pub(crate) fn slot_held(&self, slot: usize) -> Vec<u32> {
+        self.inner
+            .lock()
+            .unwrap()
+            .slot
+            .get(slot)
+            .map(|st| st.held.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// Hands engine lines to an [`EngineBus`] from outside: the mock engine's scripted responder, and
+/// the bus's own tests, in place of a pipe.
+pub(crate) struct BusFeeder {
+    bus: Arc<EngineBus>,
+}
+
+impl BusFeeder {
+    pub(crate) fn push(&self, line: impl Into<String>) {
+        self.bus.route(line.into());
+    }
+
+    /// Stdout closed: every queue reports `Ended` once it drained.
+    #[allow(dead_code)] // the cfg(test) bus tests close a hand-fed bus with it
+    pub(crate) fn close(&self) {
+        self.bus.close();
     }
 }
 
@@ -1495,7 +2136,7 @@ pub struct StdioSubprocessEngine {
 
 /// Prefix of the error when the command could not be written: the engine never saw the request, so it can be sent again
 /// to the restarted engine. (Later failures are not retried: the engine may have started generating.)
-const STDIN_WRITE_FAILED: &str = "engine stdin write failed";
+pub(crate) const STDIN_WRITE_FAILED: &str = "engine stdin write failed";
 /// The pipe took the command and the engine exited at once without a word: it was killed just before, usually (seen on
 /// Flash-Next, whose 91 threads take a moment to go). The client has seen nothing of this request, so it is sent once more.
 /// A prompt that itself crashes the engine this fast must not reach the cap sooner for it: a death on the resend costs no
@@ -1760,11 +2401,15 @@ impl StdioSubprocessEngine {
             }
         }
 
+        let nslots = info
+            .get("batch_slots")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
         Ok((
             SubprocessHandle {
                 child,
                 stdin: Arc::new(Mutex::new(EngineStdin(Some(stdin)))),
-                bus: EngineBus::spawn(reader),
+                bus: EngineBus::spawn(reader, nslots),
                 _keeper: keeper,
             },
             Ready {
@@ -2720,7 +3365,7 @@ mod engine_bus_tests {
     #[test]
     fn lines_arrive_in_order_and_eof_repeats() {
         let data = b"T 1\nT 2\nDONE 1 1 0 0 stop\n".to_vec();
-        let bus = EngineBus::spawn(BufReader::new(std::io::Cursor::new(data)));
+        let bus = EngineBus::spawn(BufReader::new(std::io::Cursor::new(data)), 0);
         assert_eq!(bus.recv().unwrap().as_deref(), Some("T 1\n"));
         assert_eq!(bus.recv().unwrap().as_deref(), Some("T 2\n"));
         assert_eq!(bus.recv().unwrap().as_deref(), Some("DONE 1 1 0 0 stop\n"));
@@ -2755,7 +3400,7 @@ mod engine_bus_tests {
             data,
             delivered: false,
         };
-        let bus = EngineBus::spawn(BufReader::new(inner));
+        let bus = EngineBus::spawn(BufReader::new(inner), 0);
         assert_eq!(bus.recv().unwrap().as_deref(), Some("T 1\n"));
         assert_eq!(bus.recv().unwrap().as_deref(), Some("T 2\n"));
         assert!(matches!(bus.recv(), Err(EngineError::EngineDied(_))));

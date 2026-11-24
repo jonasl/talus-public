@@ -2,6 +2,7 @@
 
 pub use talus_core_api as api;
 
+mod batch;
 pub mod code_span;
 pub mod config;
 #[cfg(test)]

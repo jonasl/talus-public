@@ -74,6 +74,12 @@ pub struct ServerConfig {
     pub flash_attn: String,
     pub fit: String,
     pub ctx_shift: bool,
+    /// Run a request that finds the engine to itself (no slot busy, nobody waiting) on the solo
+    /// path - the fastest stream - rather than in a batch window; an arrival then drives the
+    /// solo request into a slot (`serve/server.py`'s solo-if-idle give-way, their #1869 line of
+    /// work). `false` keeps every eligible request in a slot from admission on (run config
+    /// `"parallel_solo": false`, `--no-parallel-solo`).
+    pub parallel_solo: bool,
     pub slot_save_path: String,
     pub idle_unload_seconds: u64,
     pub mock_mode: bool,
@@ -137,6 +143,7 @@ impl Default for ServerConfig {
             flash_attn: "on".to_string(),
             fit: "off".to_string(),
             ctx_shift: false,
+            parallel_solo: true,
             slot_save_path: String::new(),
             idle_unload_seconds: 0,
             mock_mode: true,
@@ -367,6 +374,9 @@ impl ServerConfig {
         if let Some(cs) = val.get_bool("ctx_shift") {
             cfg.ctx_shift = cs;
         }
+        if let Some(ps) = val.get_bool("parallel_solo") {
+            cfg.parallel_solo = ps;
+        }
         if let Some(sp) = val
             .get_str("slot_save_path")
             .or_else(|| val.get_str("session_dir"))
@@ -454,6 +464,14 @@ impl ServerConfig {
                     }
                     "--no-ctx-shift" => {
                         cfg.ctx_shift = false;
+                        i += 1;
+                    }
+                    "--parallel-solo" => {
+                        cfg.parallel_solo = true;
+                        i += 1;
+                    }
+                    "--no-parallel-solo" => {
+                        cfg.parallel_solo = false;
                         i += 1;
                     }
                     "--kv-unified" | "-kvu" => {

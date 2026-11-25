@@ -785,4 +785,94 @@ mod tests {
             "the turn's own leg rode A's slot"
         );
     }
+
+    // The solo-if-idle policy (`parallel_solo`): a request that finds the engine to itself
+    // runs on the control lines, and an arrival's very queueing evicts it into a slot. These
+    // drive the mock's mirrored policy; the wire behaviour they pin is the real engine's.
+
+    #[test]
+    fn parallel_solo_runs_an_undisturbed_leg_on_the_control_lines() {
+        let m = mock(2);
+        m.set_parallel_solo(true);
+        m.set_batch_scripts(vec![vec![200, 201, ID_IM_END]]);
+        let (toks, t) = run(&m, 10);
+        // The leg ended on its stop token with no eviction and no second leg: nothing rode a
+        // slot, and the finish is the leg's own. The stop token itself is suppressed, as any
+        // leg that ends on one (the batch window does the same).
+        assert_eq!(toks, vec![200, 201]);
+        assert_eq!(t.finish_reason, "stop");
+    }
+
+    #[test]
+    fn an_arrival_evicts_a_solo_leg_and_it_continues_in_a_slot() {
+        let m = std::sync::Arc::new(mock(2));
+        m.set_parallel_solo(true);
+        // A paced leg gives the test a real mid-stream window; the scripts are long and the
+        // budget generous so the arrival lands (and the promotion leg still ends on
+        // `length`) even when a full test suite keeps the box busy.
+        m.set_batch_pace_ms(20);
+        // Script order on the mock's wire: A's `GEN` leg, A's promoted `BGEN`, B's `BGEN`.
+        let a1: Vec<u32> = (200..230).collect();
+        let a2: Vec<u32> = (230..240).chain(std::iter::once(ID_IM_END)).collect();
+        m.set_batch_scripts(vec![a1.clone(), a2.clone(), vec![300, 301, 302, ID_IM_END]]);
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let a = {
+            let m = m.clone();
+            let seen = seen.clone();
+            std::thread::spawn(move || {
+                let mut toks = Vec::new();
+                let t = m
+                    .generate(
+                        &request(28),
+                        Arc::new(AtomicBool::new(false)),
+                        &mut |x| {
+                            toks.push(x);
+                            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            true
+                        },
+                        &mut |_, _| {},
+                    )
+                    .expect("the evicted request completes");
+                (toks, t)
+            })
+        };
+        // Wait for A genuinely mid-read - its second token is on the wire - rather than
+        // trusting a sleep: B's queueing alone is the eviction trigger.
+        let parked = std::time::Instant::now();
+        while seen.load(std::sync::atomic::Ordering::SeqCst) < 2
+            && parked.elapsed() < std::time::Duration::from_millis(300)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let b_start = std::time::Instant::now();
+        let (b_toks, _) = run(&m, 4);
+        let b_elapsed = b_start.elapsed();
+        let (a_toks, a) = a.join().expect("A's thread lands");
+
+        // The promotion rode A's grown prompt (ids plus what the solo leg emitted), so no
+        // token doubled: the stream is A's script from its start through the emitted point,
+        // then the slot window's - contiguous, since the promotion continued the exchange.
+        // Where the legs met is timing's choice, not the test's; the scripts are disjoint
+        // ranges, so the consumer's stream shows the split exactly.
+        let cut = match a_toks.iter().position(|&t| t == 230) {
+            Some(c) => c,
+            None => panic!("no 230; stream={a_toks:?} finish={}", a.finish_reason),
+        };
+        assert_eq!(&a_toks[..cut], &a1[..cut], "the solo leg's emitted tokens");
+        assert_eq!(
+            &a_toks[cut..],
+            &a2[..a2.len() - 1],
+            "the promoted leg continues the script"
+        );
+        // The promoted leg's window ends on a stop token, and its budget covers it: the
+        // exchange's finish is that stop - never the hand-over's `cancel`, never a stray.
+        assert_eq!(a.finish_reason, "stop");
+        assert_eq!(b_toks, vec![300, 301, 302]); // the window's stop token is suppressed
+                                                 // Had A not given way, B's admission could not have been answered before A's whole
+                                                 // leg drained (its `proc`-equivalent rides the promotion).
+        assert!(
+            b_elapsed < std::time::Duration::from_millis(500),
+            "the solo leg did not give way: B waited {b_elapsed:?}"
+        );
+    }
 }

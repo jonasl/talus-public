@@ -76,6 +76,10 @@ pub(crate) struct Leg {
     pub(crate) done_reused: Option<usize>,
     /// The finish word of the admission's `DONE` line (`stop`/`length`/`cancel`/`nonfinite`/empty).
     pub(crate) finish: String,
+    /// The prompt read gave way (`BYIELD` -> `YIELDED`, server.py's #656): the engine
+    /// stopped the read at this many tokens and keeps the part read in the slot - which
+    /// stays claimed for the request coming back to finish the read.
+    pub(crate) yielded: Option<usize>,
     /// The request was cancelled before its admission ended: the `STOP` went out, and a slot
     /// that continued was `BSTOP`ped and released here.
     pub(crate) cancelled: bool,
@@ -109,7 +113,7 @@ const SLOT_TICK: Duration = Duration::from_secs(10);
 const BDONE_AFTER_EOS: Duration = Duration::from_secs(2);
 /// A slot that never frees is a hung engine, but the claim loop reaps leaked busy flags on its
 /// own way (server.py's 1 s re-check).
-const CLAIM_WAIT: Duration = Duration::from_secs(1);
+pub(crate) const CLAIM_WAIT: Duration = Duration::from_secs(1);
 
 /// The admission/pump state machine over one engine's bus. The caller owns the engine's control
 /// lines: it holds them across `admit` (which sends on them and reads them), and gives them up
@@ -131,18 +135,28 @@ impl<'a> BatchClient<'a> {
     /// and another tried, up to `BGEN_REFUSALS_MAX` times before the request fails. `cmd(slot)`
     /// builds the whole command line for the slot picked; `prompt` is the conversation's head,
     /// kept for a leaving slot's bookkeeping.
+    #[allow(clippy::too_many_arguments)] // the handshake's full hand: claim, hint, give-way, both sinks
     pub(crate) fn admit(
         &self,
         cmd: &dyn Fn(usize) -> String,
         frame: Option<&[u8]>,
         prompt: &[u32],
+        slot_hint: Option<usize>,
+        reserve: &mut dyn FnMut() -> Result<usize, EngineError>,
+        yield_way: Option<&dyn Fn() -> bool>,
         cancel: &AtomicBool,
         on_token: &mut dyn FnMut(u32, Option<TokenLogprob>) -> bool,
         on_progress: &mut dyn FnMut(usize, usize),
     ) -> Result<Leg, EngineError> {
         let mut refused = 0usize;
+        // A read that gave way (#656) comes back to the slot it parked in: the caller
+        // hands that slot here, and the claim (this side's busy mark) never dropped.
+        let mut hint = slot_hint;
         'outer: loop {
-            let slot = self.pick_slot(prompt, cancel)?;
+            let slot = match hint.take() {
+                Some(h) => h,
+                None => reserve()?,
+            };
             // Required before the send: otherwise the new request reads what its predecessor
             // left in the queue.
             self.bus.drain_slot(slot);
@@ -157,6 +171,7 @@ impl<'a> BatchClient<'a> {
             let mut pending_lp: Option<TokenLogprob> = None;
             let mut stop_sent = false;
             let mut aborted = false; // on_token false: STOP goes out, the leg is read to its end
+            let mut asked = false; // one `BYIELD` per admission, as server.py's `ask` latch
             loop {
                 match self.bus.recv_ctl(Some(CTL_POLL))? {
                     BusLine::TimedOut => {
@@ -199,6 +214,17 @@ impl<'a> BatchClient<'a> {
                             ) {
                                 on_progress(leg.reused + read, total);
                             }
+                            // A read still ahead of its first token, and a shorter
+                            // request waiting: the chunk boundary just reported is
+                            // where the read stops, into this slot (server.py's #656).
+                            if !asked && leg.admission.is_none() && yield_way.is_some_and(|f| f()) {
+                                self.sink.send(&format!("BYIELD {slot}"), None)?;
+                                asked = true;
+                            }
+                        } else if let Some(rest) = trimmed.strip_prefix("YIELDED ") {
+                            // <slot> <tokens read>: the engine took the give-way.
+                            let f: Vec<&str> = rest.split_whitespace().collect();
+                            leg.yielded = f.get(1).and_then(|x| x.parse::<usize>().ok());
                         } else if let Some(rest) = trimmed.strip_prefix("DONE ") {
                             let f: Vec<&str> = rest.split_whitespace().collect();
                             leg.prompt_n =
@@ -223,13 +249,28 @@ impl<'a> BatchClient<'a> {
                                 leg.cancelled = true;
                             }
                             if !leg.cont {
-                                // The whole leg rode the admission: no `BDONE` will come to free
-                                // the slot, so the hold is settled here - prompt plus the
-                                // admission's token, but the last one.
-                                self.bus.release_done(
-                                    slot,
-                                    slot_holds(prompt, leg.admission.as_slice(), &leg.finish),
-                                );
+                                match leg.yielded {
+                                    // The part read waits in the slot: the claim rides to
+                                    // the re-admission, unless the request is leaving -
+                                    // then the hold settles as what the engine has.
+                                    Some(_) if !cancel.load(Ordering::Relaxed) => {}
+                                    Some(n) => self
+                                        .bus
+                                        .release_done(slot, prompt[..n.min(prompt.len())].to_vec()),
+                                    None => {
+                                        // The whole leg rode the admission: no `BDONE` will
+                                        // come to free the slot, so the hold is settled here
+                                        // - prompt plus the admission's token, but the last.
+                                        self.bus.release_done(
+                                            slot,
+                                            slot_holds(
+                                                prompt,
+                                                leg.admission.as_slice(),
+                                                &leg.finish,
+                                            ),
+                                        );
+                                    }
+                                }
                             }
                             return Ok(leg);
                         } else if let Some(rest) = trimmed.strip_prefix("ERR") {
@@ -405,23 +446,19 @@ impl<'a> BatchClient<'a> {
     /// The first free slot, waiting for one. Their #1603: a busy flag with no owner is a leak,
     /// and the claim loop is where such a flag gets reaped - a frozen flag otherwise waits
     /// forever on a slot nothing will free.
-    fn pick_slot(&self, prompt: &[u32], cancel: &AtomicBool) -> Result<usize, EngineError> {
-        loop {
-            if let Some(s) = self.bus.claim_slot_with(|free, busy, total| {
-                let gs = if self.groups > 1 && total.is_multiple_of(self.groups) {
-                    total / self.groups
-                } else {
-                    0
-                };
-                pick_slot_index(free, busy, total, self.groups, gs, prompt)
-            }) {
-                return Ok(s);
-            }
-            if cancel.load(Ordering::Relaxed) {
-                return Err(EngineError::Cancelled);
-            }
-            self.bus.wait_slot(CLAIM_WAIT);
-        }
+    /// The one-shot claim of `pick_slot`'s wait: the free slot holding the prompt's
+    /// start, or the oldest free one - or none, with a slot nobody is waiting for still
+    /// a possibility. The waiting is the caller's (`admit`'s `reserve`), so it can hand
+    /// the control lines back while it lasts (server.py's #1603).
+    pub(crate) fn try_pick(&self, prompt: &[u32]) -> Option<usize> {
+        self.bus.claim_slot_with(|free, busy, total| {
+            let gs = if self.groups > 1 && total.is_multiple_of(self.groups) {
+                total / self.groups
+            } else {
+                0
+            };
+            pick_slot_index(free, busy, total, self.groups, gs, prompt)
+        })
     }
 }
 
@@ -550,6 +587,15 @@ mod tests {
             raw_frame: None,
             lens: Vec::new(),
             img_px: None,
+        }
+    }
+
+    /// A request with `plen` prompt tokens - enough of a difference from the stock
+    /// 16 for the give-way rule (`lens[shorter] * 2 <= longer`) to want one.
+    fn request_len(max_new: usize, plen: usize) -> GenerateRequest {
+        GenerateRequest {
+            prompt_ids: (100..(100 + plen as u32)).collect(),
+            ..request(max_new)
         }
     }
 
@@ -998,5 +1044,78 @@ mod tests {
             "nothing after the stop token"
         );
         assert_eq!(b_toks, vec![300, 301, 302]);
+    }
+
+    #[test]
+    fn a_shorter_arrival_parks_a_long_read_and_reopens_it_in_a_slot() {
+        let m = std::sync::Arc::new(mock(2));
+        m.set_parallel_solo(true);
+        m.set_batch_pace_ms(20);
+        // Script order on the wire: A's solo leg - whose tokens never reach the
+        // consumer, the read parks before its first token - then the two slot
+        // admissions: the short request's, and A's continuation in the slot its
+        // read parked in. (Which reaches the mock's wire first is the mock's
+        // unfair mutex's choice; correctness is the same either way, so the
+        // assertions below only pin the pairing.)
+        m.set_batch_scripts(vec![
+            vec![200, 201, 202],
+            vec![300, 301, 302, ID_IM_END],
+            vec![500, 501, 502, ID_IM_END],
+        ]);
+        let pps = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let a = {
+            let m = m.clone();
+            let pps = pps.clone();
+            std::thread::spawn(move || {
+                let mut toks = Vec::new();
+                let t = m
+                    .generate(
+                        &request_len(60, 40),
+                        Arc::new(AtomicBool::new(false)),
+                        &mut |x| {
+                            toks.push(x);
+                            true
+                        },
+                        &mut |_, _| {
+                            pps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        },
+                    )
+                    .expect("the parked request completes");
+                (toks, t)
+            })
+        };
+        // A reads on the control lines; once its first chunk is reported, B
+        // arrives - a prompt under half A's - and A gives way at the next one.
+        let parked = std::time::Instant::now();
+        while pps.load(std::sync::atomic::Ordering::SeqCst) < 1
+            && parked.elapsed() < std::time::Duration::from_millis(500)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let (b_toks, _) = run(&m, 8);
+        let (a_toks, a) = a.join().expect("A's thread lands");
+
+        // The pinned facts: the parked leg emitted nothing, both requests finish
+        // whole in the slot protocol, and the exchange leaves no claim behind.
+        assert!(
+            !a_toks.iter().any(|t| *t >= 200 && *t < 300),
+            "the parked read emitted its tokens: {a_toks:?}"
+        );
+        let park_reopened = a_toks.first() == Some(&500);
+        assert!(
+            park_reopened || a_toks.first() == Some(&300),
+            "no slot leg after the park: {a_toks:?} finish={}",
+            a.finish_reason
+        );
+        let (want_a, want_b): (&[u32], &[u32]) = if park_reopened {
+            (&[500, 501, 502], &[300, 301, 302])
+        } else {
+            (&[300, 301, 302], &[500, 501, 502])
+        };
+        assert_eq!(&a_toks[..], want_a, "A's continuation");
+        assert_eq!(&b_toks[..], want_b, "the short request");
+        assert_eq!(a.finish_reason, "stop");
+        let bus = m.batch_bus().expect("the mock's batch bus");
+        assert!(bus.slots_idle(), "a claim leaked past the hand-over");
     }
 }

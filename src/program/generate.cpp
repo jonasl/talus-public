@@ -10008,6 +10008,15 @@ static int qwen4exp_engine_main(int argc, char** argv) {
         }
         auto next_line = [&](std::string& out) -> bool {
             if (rust_stdin) {
+                {   // the scans below pull lines out of the driver's queue into this deque:
+                    // they go to the serve loop before the queue is asked again
+                    std::lock_guard<std::mutex> lk(in_mu);
+                    if (!in_lines.empty()) {
+                        out = std::move(in_lines.front());
+                        in_lines.pop_front();
+                        return true;
+                    }
+                }
                 const char* ptr = nullptr;
                 size_t len = 0;
                 const int rc = g_qwen4exp_rust_driver->next_line(g_qwen4exp_rust_driver->user_data, 1, &ptr, &len);
@@ -10410,6 +10419,14 @@ static int qwen4exp_engine_main(int argc, char** argv) {
         auto batch_on = [&] { for (const BSlot& b : bs) if (b.active) return true; return false; };
         auto try_next_line = [&](std::string& out) -> bool {
             if (rust_stdin) {
+                {   // as in `next_line`: scan-pulled lines go first
+                    std::lock_guard<std::mutex> lk(in_mu);
+                    if (!in_lines.empty()) {
+                        out = std::move(in_lines.front());
+                        in_lines.pop_front();
+                        return true;
+                    }
+                }
                 const char* ptr = nullptr;
                 size_t len = 0;
                 const int rc = g_qwen4exp_rust_driver->next_line(g_qwen4exp_rust_driver->user_data, 0, &ptr, &len);
@@ -13837,6 +13854,17 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                     int ys = -1;
                     {   // a BSTOP that came meanwhile ends its slot at its next window; a BYIELD is for this read
                         std::lock_guard<std::mutex> lk(in_mu);
+                        // with the Rust driver owning stdin, its reader thread queues lines
+                        // this deque would never see: pull them at the boundary, so a BYIELD
+                        // lands here rather than at the next dispatch (#656)
+                        if (rust_stdin) {
+                            const char* ptr = nullptr;
+                            size_t len = 0;
+                            while (g_qwen4exp_rust_driver->next_line(g_qwen4exp_rust_driver->user_data, 0, &ptr, &len) >
+                                       0 &&
+                                   ptr != nullptr)
+                                in_lines.emplace_back(ptr, len);
+                        }
                         for (auto it = in_lines.begin(); it != in_lines.end();) {
                             if (it->rfind("BSTOP ", 0) == 0) {
                                 const int b = std::atoi(it->c_str() + 6);

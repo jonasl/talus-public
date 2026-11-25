@@ -1039,6 +1039,8 @@ pub(crate) struct MockBatch {
     scripts: Arc<Mutex<std::collections::VecDeque<Vec<u32>>>>,
     pace_ms: Arc<AtomicU64>,
     refusals: Arc<AtomicUsize>,
+    /// Pipelined groups the mock reports (`set_batch_groups`), for the picker's group rules.
+    groups: Arc<AtomicUsize>,
     stopped: Arc<Mutex<std::collections::HashSet<usize>>>,
     /// Concurrent requests serialize on their admission, exactly as the real server's control
     /// handoff does: one `BGEN` answered on the control lines at a time.
@@ -1060,6 +1062,7 @@ impl ScriptedMockEngine {
             feeder: Arc::new(feeder),
             tx,
             scripts: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            groups: Arc::new(AtomicUsize::new(1)),
             pace_ms: Arc::new(AtomicU64::new(0)),
             refusals: Arc::new(AtomicUsize::new(0)),
             stopped: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -1068,6 +1071,15 @@ impl ScriptedMockEngine {
         let responder = shared.clone();
         thread::spawn(move || mock_batch_responder(rx, responder));
         *slot = Some(shared);
+    }
+
+    /// The pipelined group count the batch client should see (the engine's `INFO
+    /// batch_groups=`), for the slot choice's group rules.
+    pub fn set_batch_groups(&self, g: usize) {
+        let slot = self.batch.lock().unwrap();
+        if let Some(b) = slot.as_ref() {
+            b.groups.store(g, Ordering::Relaxed);
+        }
     }
 
     /// The token scripts the batch responder serves, one per `BGEN`.
@@ -1124,6 +1136,7 @@ impl ScriptedMockEngine {
         let client = crate::batch::BatchClient {
             bus: &b.bus,
             sink: &sink,
+            groups: b.groups.load(Ordering::Relaxed),
         };
         let cmd = |slot: usize| format!("BGEN {slot} {}{} {}", req.max_new_tokens, keys, csv);
         let is_stop = |t: u32| self.tok.is_stop_token(t) || req.stop_tokens.contains(&t);
@@ -1649,6 +1662,8 @@ struct SlotState {
     orphan_since: Option<Instant>,
     /// What the slot's conversation holds: the prompt and every token fed, all but the last.
     held: Vec<u32>,
+    /// The pick sequence at the last claim of this slot: the picker's "used longest ago" tiebreak.
+    last_use: u64,
 }
 
 struct BusInner {
@@ -1658,6 +1673,8 @@ struct BusInner {
     slot: Vec<SlotState>,
     nslots: usize,
     ended: bool,
+    /// Counts slot claims, so `last_use` orders them without wall-clock ties.
+    use_seq: u64,
 }
 
 /// Every engine line after `READY` reaches its consumer through here: a dedicated reader thread
@@ -1745,10 +1762,12 @@ impl EngineBus {
                         park_until: None,
                         orphan_since: None,
                         held: Vec::new(),
+                        last_use: 0,
                     })
                     .collect(),
                 nslots,
                 ended: false,
+                use_seq: 0,
             }),
             signal: std::sync::Condvar::new(),
             read_err: Mutex::new(None),
@@ -1902,7 +1921,15 @@ impl EngineBus {
     /// refusal that aged out and any busy flag whose owner leaked - their #1603 gives such a flag
     /// `orphan_slot` of looking ownerless first, so a slot set moments before its owner registers
     /// is never taken.
-    pub(crate) fn claim_free_slot(&self) -> Option<usize> {
+    /// Claim a slot chosen among the free ones by `pick`. The park sweep and the #1603
+    /// orphan-age fallback are the machinery behind every claim, shared: `pick` sees
+    /// the free slots - index, held conversation, and the claim-sequence stamp of their last
+    /// use - plus which slots are busy and the total, and returns the index to take; None
+    /// (or an unsuitable one) leaves the claim to the orphan path.
+    pub(crate) fn claim_slot_with(
+        &self,
+        pick: impl FnOnce(&[(usize, &[u32], u64)], &[usize], usize) -> Option<usize>,
+    ) -> Option<usize> {
         let mut guard = self.inner.lock().unwrap();
         let now = Instant::now();
         let orphan = Duration::from_nanos(self.orphan_slot_ns.load(Ordering::Relaxed));
@@ -1916,13 +1943,32 @@ impl EngineBus {
                 }
             }
         }
-        for (s, st) in guard.slot.iter_mut().enumerate() {
-            if !st.busy {
-                st.busy = true;
-                st.claimed = true;
-                st.orphan_since = None;
-                return Some(s);
+        let choice = {
+            let mut free: Vec<(usize, &[u32], u64)> = Vec::new();
+            for (s, st) in guard.slot.iter().enumerate() {
+                if !st.busy {
+                    free.push((s, st.held.as_slice(), st.last_use));
+                }
             }
+            if free.is_empty() {
+                None
+            } else {
+                let busy: Vec<usize> = (0..guard.slot.len())
+                    .filter(|s| guard.slot[*s].busy)
+                    .collect();
+                pick(&free, &busy, guard.slot.len())
+                    .filter(|s| *s < guard.slot.len() && !guard.slot[*s].busy)
+            }
+        };
+        if let Some(s) = choice {
+            let seq = guard.use_seq + 1;
+            guard.use_seq = seq;
+            let st = &mut guard.slot[s];
+            st.busy = true;
+            st.claimed = true;
+            st.orphan_since = None;
+            st.last_use = seq;
+            return Some(s);
         }
         for (s, st) in guard.slot.iter_mut().enumerate() {
             if st.busy && !st.claimed && !st.releasing && st.park_until.is_none() {
@@ -2902,7 +2948,11 @@ impl StdioSubprocessEngine {
             }
             _ => format!("BGEN {slot} {}{keys} {csv}", req.max_new_tokens),
         };
-        let client = BatchClient { bus, sink };
+        let client = BatchClient {
+            bus,
+            sink,
+            groups: self.batch_groups(),
+        };
         let is_stop = |t: u32| self.tok.is_stop_token(t) || req.stop_tokens.contains(&t);
         client.admit(
             &cmd,
@@ -2931,7 +2981,11 @@ impl StdioSubprocessEngine {
         cancel: &Arc<AtomicBool>,
         on_token: &mut dyn FnMut(u32, Option<TokenLogprob>) -> bool,
     ) -> Result<EngineTimings, EngineError> {
-        let client = BatchClient { bus, sink };
+        let client = BatchClient {
+            bus,
+            sink,
+            groups: self.batch_groups(),
+        };
         let emitted: Vec<u32> = leg.admission.into_iter().collect();
         let is_stop = |t: u32| self.tok.is_stop_token(t) || req.stop_tokens.contains(&t);
         let res = client.pump(leg.slot, &req.prompt_ids, &emitted, cancel, &mut |t| {

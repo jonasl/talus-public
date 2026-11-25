@@ -109,6 +109,9 @@ const CLAIM_WAIT: Duration = Duration::from_secs(1);
 pub(crate) struct BatchClient<'a> {
     pub(crate) bus: &'a EngineBus,
     pub(crate) sink: &'a dyn BatchSink,
+    /// The engine's pipelined slot groups (`INFO batch_groups=`, 1 without): drives the slot
+    /// choice's group economics, as upstream's picker weighs them.
+    pub(crate) groups: usize,
 }
 
 impl<'a> BatchClient<'a> {
@@ -130,7 +133,7 @@ impl<'a> BatchClient<'a> {
     ) -> Result<Leg, EngineError> {
         let mut refused = 0usize;
         'outer: loop {
-            let slot = self.pick_slot(cancel)?;
+            let slot = self.pick_slot(prompt, cancel)?;
             // Required before the send: otherwise the new request reads what its predecessor
             // left in the queue.
             self.bus.drain_slot(slot);
@@ -372,9 +375,16 @@ impl<'a> BatchClient<'a> {
     /// The first free slot, waiting for one. Their #1603: a busy flag with no owner is a leak,
     /// and the claim loop is where such a flag gets reaped - a frozen flag otherwise waits
     /// forever on a slot nothing will free.
-    fn pick_slot(&self, cancel: &AtomicBool) -> Result<usize, EngineError> {
+    fn pick_slot(&self, prompt: &[u32], cancel: &AtomicBool) -> Result<usize, EngineError> {
         loop {
-            if let Some(s) = self.bus.claim_free_slot() {
+            if let Some(s) = self.bus.claim_slot_with(|free, busy, total| {
+                let gs = if self.groups > 1 && total.is_multiple_of(self.groups) {
+                    total / self.groups
+                } else {
+                    0
+                };
+                pick_slot_index(free, busy, total, self.groups, gs, prompt)
+            }) {
                 return Ok(s);
             }
             if cancel.load(Ordering::Relaxed) {
@@ -383,6 +393,96 @@ impl<'a> BatchClient<'a> {
             self.bus.wait_slot(CLAIM_WAIT);
         }
     }
+}
+
+/// The port of `serve/server.py`'s slot choice: `free` is the free slots (index, held
+/// conversation, last-use stamp) in index order, `busy` the busy indices, `total` the slot
+/// count. `slot_groups`/`slot_gs` carry upstream's `slot_groups`/`slot_gs`: the group count,
+/// and the pipeline stride when the engine actually steps a group's slots in one window -
+/// `slot_gs == 0` means groups the engine does not pipeline (what `talus-server` always passes
+/// today, since it learns groups only from `INFO batch_groups=`, which reports pipelined ones).
+/// It is pure so the group-mode rules - which a non-grouped engine never exercises - stay
+/// unit-testable.
+///
+/// Three regimes, as upstream. Pipelined groups: the conversation a pipelined slot holds is
+/// not a conversation cache, so prefix scoring gives way to window economics - fill a hole
+/// below a busy slot of the same group (it costs no extra row), then spread over the groups in
+/// stage-first order. Non-pipelined groups keep prefix scoring but demand a prefix worth
+/// unbalancing the groups for (512 tokens), then spread by fewest-busy-group. No groups at
+/// all: any held prefix wins, else the free slot that holds nothing, oldest use first - so the
+/// conversations other slots hold stay for their next turns.
+pub(crate) fn pick_slot_index(
+    free: &[(usize, &[u32], u64)],
+    busy: &[usize],
+    total: usize,
+    slot_groups: usize,
+    slot_gs: usize,
+    prompt: &[u32],
+) -> Option<usize> {
+    if free.is_empty() {
+        return None;
+    }
+    // A group count that does not divide the slot count is no grouping at all, as upstream's
+    // start-up check demands; `stride` then degenerates and the branch flag says non-pipelined.
+    let groups = if slot_groups > 1 && total.is_multiple_of(slot_groups) {
+        slot_groups
+    } else {
+        1
+    };
+    let stride = total / groups;
+    let pipelined = groups > 1 && slot_gs > 0;
+    // The order that spreads across the pipeline's groups first: all of stage 0, then stage 1:
+    // 0, gs, 2gs.., then 1, gs+1, ... For one group this is just the natural order.
+    let order: Vec<usize> = if groups > 1 {
+        (0..stride)
+            .flat_map(|t| (0..groups).map(move |g| g * stride + t))
+            .collect()
+    } else {
+        (0..total).collect()
+    };
+    let in_order = |b: usize| order.iter().position(|x| *x == b).unwrap_or(usize::MAX);
+    let free: Vec<(usize, &[u32], u64)> = {
+        let mut f: Vec<(usize, &[u32], u64)> = free.to_vec();
+        f.sort_by_key(|(b, _, _)| in_order(*b));
+        f
+    };
+    if pipelined {
+        // A pipelined group's window spans its slots up to its last busy one, so a free slot
+        // below a busy one of its group costs no extra row.
+        let fills_hole = |b: usize| {
+            let g0 = b - b % stride;
+            (b + 1..g0 + stride).any(|x| busy.contains(&x))
+        };
+        return free
+            .iter()
+            .min_by_key(|(b, _, _)| (usize::from(!fills_hole(*b)), in_order(*b)))
+            .map(|(b, _, _)| *b);
+    }
+    let held_prefix = |h: &[u32]| -> usize {
+        if !h.is_empty() && h.len() < prompt.len() && prompt[..h.len()] == *h {
+            h.len()
+        } else {
+            0
+        }
+    };
+    let best = free
+        .iter()
+        .max_by_key(|(_, held, _)| held_prefix(held))
+        .copied()
+        .expect("free is not empty");
+    if held_prefix(best.1) >= if groups > 1 { 512 } else { 1 } {
+        return Some(best.0);
+    }
+    let busy_in = |b: usize| -> usize {
+        if groups <= 1 {
+            return 0;
+        }
+        let g = b / stride;
+        busy.iter().filter(|x| **x / stride == g).count()
+    };
+    free.iter()
+        .min_by_key(|(b, held, used)| (busy_in(*b), usize::from(!held.is_empty()), *used))
+        .map(|(b, _, _)| *b)
 }
 
 /// What a slot holds after feeding `emitted` on top of `prompt`: all of it but the last token
@@ -449,6 +549,12 @@ mod tests {
         (toks, timings)
     }
 
+    /// A plain claim of any free slot: the picker with no preference, for tests that only
+    /// want to know a slot was released.
+    fn take_free(bus: &crate::engine::EngineBus) -> Option<usize> {
+        bus.claim_slot_with(|free, _, _| free.first().map(|(s, _, _)| *s))
+    }
+
     fn held(m: &ScriptedMockEngine, slot: usize) -> Vec<u32> {
         m.batch_bus().unwrap().slot_held(slot)
     }
@@ -464,7 +570,7 @@ mod tests {
         // The slot keeps the conversation but the last token - the engine's cache rule.
         assert_eq!(held(&m, 0).len(), request(4).prompt_ids.len() + 3);
         // Free again for the next request.
-        assert_eq!(m.batch_bus().unwrap().claim_free_slot(), Some(0));
+        assert_eq!(take_free(&m.batch_bus().unwrap()), Some(0));
     }
 
     #[test]
@@ -476,7 +582,7 @@ mod tests {
         assert_eq!(t.finish_reason, "stop");
         assert_eq!(t.predicted_n, 2);
         assert_eq!(held(&m, 0).len(), request(8).prompt_ids.len() + 2);
-        assert_eq!(m.batch_bus().unwrap().claim_free_slot(), Some(0));
+        assert_eq!(take_free(&m.batch_bus().unwrap()), Some(0));
     }
 
     #[test]
@@ -489,7 +595,7 @@ mod tests {
         assert_eq!(t.predicted_n, 0);
         // prompt + one token, less the last: the prompt is what the slot still holds.
         assert_eq!(held(&m, 0), request(4).prompt_ids);
-        assert_eq!(m.batch_bus().unwrap().claim_free_slot(), Some(0));
+        assert_eq!(take_free(&m.batch_bus().unwrap()), Some(0));
     }
 
     #[test]
@@ -529,13 +635,13 @@ mod tests {
         assert_eq!(toks, vec![10, 11]);
         assert_eq!(t.finish_reason, "cancel");
         // Freed without ever reading the slot's remaining lines: the router took them.
-        assert_eq!(m.batch_bus().unwrap().claim_free_slot(), Some(0));
+        assert_eq!(take_free(&m.batch_bus().unwrap()), Some(0));
     }
 
     #[test]
     fn router_finishes_a_releasing_slot_at_its_bdone() {
         let (bus, feeder) = EngineBus::manual(1);
-        assert_eq!(bus.claim_free_slot(), Some(0));
+        assert_eq!(take_free(&bus), Some(0));
         // The consumer left with 1,2,3 seen; the engine is still feeding the slot.
         assert!(!bus.begin_release(0, vec![1, 2, 3]));
         feeder.push("BT 0 4");
@@ -546,18 +652,18 @@ mod tests {
         feeder.push("BDONE 0 4 stop 1.0");
         // 1,2,3 carried over, 4 swallowed from the wire, less the last one.
         assert_eq!(bus.slot_held(0), vec![1, 2, 3]);
-        assert_eq!(bus.claim_free_slot(), Some(0));
+        assert_eq!(take_free(&bus), Some(0));
     }
 
     #[test]
     fn router_drops_everything_on_a_nonfinite_bdone() {
         let (bus, feeder) = EngineBus::manual(1);
-        assert_eq!(bus.claim_free_slot(), Some(0));
+        assert_eq!(take_free(&bus), Some(0));
         assert!(!bus.begin_release(0, vec![1, 2]));
         feeder.push("BT 0 3");
         feeder.push("BDONE 0 3 nonfinite 1.0");
         assert!(bus.slot_held(0).is_empty()); // their #879: the slot's state is gone
-        assert_eq!(bus.claim_free_slot(), Some(0));
+        assert_eq!(take_free(&bus), Some(0));
     }
 
     #[test]
@@ -586,5 +692,97 @@ mod tests {
             bus.recv_ctl(Some(std::time::Duration::from_millis(50))),
             Ok(BusLine::Ended)
         ));
+    }
+
+    #[test]
+    fn the_slot_choice_takes_the_held_conversation_prefix() {
+        let empty = Vec::<u32>::new();
+        let ha = vec![7u32, 8, 9];
+        let free = vec![(0usize, empty.as_slice(), 1u64), (1, ha.as_slice(), 2)];
+        // A held start of the prompt wins, whatever else the slots hold.
+        assert_eq!(
+            pick_slot_index(&free, &[], 2, 1, 0, &[7, 8, 9, 10]),
+            Some(1)
+        );
+        // A hold equal to the prompt is not a prefix (the engine reads nothing then - their
+        // rule, kept): the empty slot gets the request instead.
+        assert_eq!(pick_slot_index(&free, &[], 2, 1, 0, &[7, 8, 9]), Some(0));
+        // No prefix: prefer the slot that holds nothing, then the one used longest ago.
+        let h5 = vec![5u32];
+        let h9 = vec![9u32];
+        let free = vec![
+            (0usize, h5.as_slice(), 9u64),
+            (1, h9.as_slice(), 3),
+            (2, empty.as_slice(), 7),
+        ];
+        assert_eq!(pick_slot_index(&free, &[], 3, 1, 0, &[7, 7]), Some(2));
+        let free = vec![(0usize, h5.as_slice(), 9u64), (1, h9.as_slice(), 3)];
+        assert_eq!(pick_slot_index(&free, &[], 2, 1, 0, &[7, 7]), Some(1));
+        assert_eq!(pick_slot_index(&[], &[], 2, 1, 0, &[7, 7]), None);
+    }
+
+    #[test]
+    fn the_slot_choice_follows_the_pipeline_group_rules() {
+        let empty = Vec::<u32>::new();
+        fn slot(idx: usize, held: &[u32]) -> (usize, &[u32], u64) {
+            (idx, held, 0)
+        }
+        // Pipelined groups (total 4, groups 2): a free slot under a busy one of its group
+        // joins the busy slot's window for free - the hole beats the spread order.
+        let f = vec![slot(0, &empty), slot(1, &empty), slot(2, &empty)];
+        assert_eq!(pick_slot_index(&f, &[3], 4, 2, 2, &[1]), Some(2));
+        // No holes: spread stage-first (order 0, 2, 1, 3).
+        let f = vec![slot(1, &empty), slot(2, &empty), slot(3, &empty)];
+        assert_eq!(pick_slot_index(&f, &[0], 4, 2, 2, &[1]), Some(2));
+        // Pipelined holds are no conversation cache: a perfect prefix loses to group economics.
+        let ha = vec![1u32, 2];
+        let f = vec![slot(1, &ha), slot(2, &empty)];
+        assert_eq!(pick_slot_index(&f, &[0, 3], 4, 2, 2, &[1, 2, 3]), Some(2));
+        // Non-pipelined groups demand a 512-token prefix before unbalancing the groups: 4 lose.
+        let f = vec![slot(0, &ha), slot(2, &empty)];
+        assert_eq!(pick_slot_index(&f, &[1, 3], 4, 2, 0, &[1, 2, 3]), Some(2));
+        // ... and take the prefix when it is worth it.
+        let long = (0..512u32).collect::<Vec<_>>();
+        let prompt = (0..600u32).collect::<Vec<_>>();
+        let f = vec![(1usize, long.as_slice(), 0u64), (2, empty.as_slice(), 1)];
+        assert_eq!(pick_slot_index(&f, &[0, 3], 4, 2, 0, &prompt), Some(1));
+        // A group count that does not divide the slots is no grouping at all.
+        let f = vec![slot(0, &ha), slot(1, &empty)];
+        assert_eq!(pick_slot_index(&f, &[], 2, 3, 1, &[1, 2, 3]), Some(0));
+    }
+
+    #[test]
+    fn the_next_turn_lands_on_the_slot_that_holds_the_conversation() {
+        let m = mock(2);
+        m.set_batch_scripts(vec![vec![10, 11], vec![20, 21], vec![30, 31]]);
+        // Two conversations, first turns: the second goes to the slot still empty, not the
+        // one holding the other conversation.
+        let (a1, _) = run(&m, 2); // slot 0: prompt 100..116 plus 10, 11 (minus the last held)
+        let mut req_b = request(2);
+        req_b.prompt_ids = (200u32..216).collect();
+        run_req(&m, req_b.clone()); // slot 1: it was the one holding nothing
+        let held_0 = held(&m, 0);
+        let held_1 = held(&m, 1);
+        // Conversation A's next turn: its prompt must admit on slot 0, the slot holding it.
+        let mut turn2 = request(2);
+        turn2.prompt_ids = (100u32..116)
+            .chain(a1.iter().copied())
+            .chain([999])
+            .collect();
+        let (_, _) = run_req(&m, turn2);
+        assert!(
+            held(&m, 0).starts_with(&held_0[..5]) && held(&m, 0).len() > held_0.len(),
+            "A's slot absorbed the turn: held grew from {held_0:?}"
+        );
+        assert_eq!(
+            held(&m, 1),
+            held_1,
+            "the other slot's conversation stayed put"
+        );
+        assert_eq!(
+            held(&m, 0).last().copied(),
+            Some(30),
+            "the turn's own leg rode A's slot"
+        );
     }
 }

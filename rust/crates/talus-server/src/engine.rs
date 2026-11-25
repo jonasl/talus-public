@@ -1051,6 +1051,9 @@ pub(crate) struct MockBatch {
     /// leg's flag, never the running one's.
     solo_stop: Arc<AtomicBool>,
     solo_gen: Arc<AtomicUsize>,
+    /// Whether the mock's engine keeps slot sessions cached (`INFO slot_cache=1`, the
+    /// pull-back's precondition). On: the responder's slots do hold their conversations.
+    slot_cache: AtomicBool,
     /// The solo-if-idle policy (`set_parallel_solo`; off by default in the mock, where every
     /// existing batch test scripts its request straight into a slot).
     parallel_solo: Arc<AtomicBool>,
@@ -1089,6 +1092,7 @@ impl ScriptedMockEngine {
             admit_lock: Arc::new(Mutex::new(())),
             solo_stop: Arc::new(AtomicBool::new(false)),
             solo_gen: Arc::new(AtomicUsize::new(0)),
+            slot_cache: AtomicBool::new(true),
             parallel_solo: Arc::new(AtomicBool::new(false)),
             waiters: Waiters::default(),
         });
@@ -1156,152 +1160,203 @@ impl ScriptedMockEngine {
             sink: &sink,
             groups: b.groups.load(Ordering::Relaxed),
         };
-        // The solo-if-idle mirror of `StdioSubprocessEngine::generate_with_logprobs`: register
-        // at the queue, take the mock's admission lock (its `proc`), and run the leg on the
-        // control lines when the engine is alone - an arrival's queueing evicts it.
-        let mut carry: Option<EngineTimings> = None;
+        // The solo-if-idle mirror of `StdioSubprocessEngine::generate_with_logprobs`,
+        // pull-back and all: register at the queue, take the mock's admission lock (its
+        // `proc`), and run the leg on the control lines when the engine is alone - an
+        // arrival's queueing evicts it; and a slot leg that finds the engine alone ends
+        // its window with a `BSTOP` and continues on the control lines (server.py's
+        // `_may_go_solo`).
+        let mut carry: Vec<EngineTimings> = Vec::new();
+        let mut emitted_total = 0usize;
+        let mut pulls = 0usize;
         let mut prompt: Vec<u32> = req.prompt_ids.clone();
         let mut proc_guard: Option<std::sync::MutexGuard<'_, ()>> = None;
-        if b.parallel_solo.load(Ordering::Relaxed) && req.max_new_tokens > 1 {
-            let ticket = b.waiters.register(prompt.len());
-            let guard = b.admit_lock.lock().unwrap();
-            drop(ticket);
-            if b.bus.slots_idle() && b.waiters.count() == 0 {
-                let evict = || b.waiters.count() > 0;
-                match self.mock_solo_leg(
-                    &b,
-                    &sink,
-                    req,
-                    &prompt,
-                    req.max_new_tokens,
-                    &keys,
-                    cancel,
-                    &evict,
-                    on_token,
-                    on_progress,
-                )? {
-                    SoloOutcome::Done(t) => return Ok(t),
-                    SoloOutcome::Evicted { emitted, timings } => {
-                        let left = req.max_new_tokens.saturating_sub(emitted.len());
-                        if cancel.load(Ordering::Relaxed) {
-                            return Ok(timings);
+        let composed = |legs: &[EngineTimings], t: EngineTimings| match legs {
+            [] => t,
+            _ => compose_legs_all(legs, t),
+        };
+        loop {
+            let left = req.max_new_tokens.saturating_sub(emitted_total);
+            if b.parallel_solo.load(Ordering::Relaxed) && left > 1 {
+                let ticket = b.waiters.register(prompt.len());
+                let guard = b.admit_lock.lock().unwrap();
+                drop(ticket);
+                if b.bus.slots_idle() && b.waiters.count() == 0 {
+                    let evict = || b.waiters.count() > 0;
+                    match self.mock_solo_leg(
+                        &b,
+                        &sink,
+                        req,
+                        &prompt,
+                        left,
+                        &keys,
+                        cancel,
+                        &evict,
+                        on_token,
+                        on_progress,
+                    )? {
+                        SoloOutcome::Done(t) => return Ok(composed(&carry, t)),
+                        SoloOutcome::Evicted { emitted, timings } => {
+                            if cancel.load(Ordering::Relaxed) {
+                                return Ok(composed(&carry, timings));
+                            }
+                            let spent = emitted.len();
+                            if left.saturating_sub(spent) == 0 {
+                                let mut t = timings;
+                                t.finish_reason = "length".to_string();
+                                return Ok(composed(&carry, t));
+                            }
+                            carry.push(timings);
+                            emitted_total += spent;
+                            prompt.extend(emitted);
                         }
-                        if left == 0 {
-                            let mut t = timings;
-                            t.finish_reason = "length".to_string();
-                            return Ok(t);
-                        }
-                        carry = Some(timings);
-                        prompt.extend(emitted);
                     }
                 }
+                // A promoted leg admits with the lock still held, as the real engine's
+                // evicted leg keeps `proc` through its BGEN handshake.
+                proc_guard = Some(guard);
             }
-            // A promoted leg admits with the lock still held, as the real engine's evicted leg
-            // keeps `proc` through its BGEN handshake.
-            proc_guard = Some(guard);
-        }
-        let max_new = req
-            .max_new_tokens
-            .saturating_sub(prompt.len().saturating_sub(req.prompt_ids.len()));
-        let csv = prompt
-            .iter()
-            .map(|id| id.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        let cmd = |slot: usize| format!("BGEN {slot} {max_new}{keys} {csv}");
-        let is_stop = |t: u32| self.tok.is_stop_token(t) || req.stop_tokens.contains(&t);
-        let with_carry = |t: EngineTimings| match &carry {
-            Some(first) => compose_legs(first, t),
-            None => t,
-        };
-        let leg = {
-            let _admit = match proc_guard.take() {
-                Some(g) => g,
-                None => b.admit_lock.lock().unwrap(),
+            let max_new = left;
+            let csv = prompt
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let cmd = |slot: usize| format!("BGEN {slot} {max_new}{keys} {csv}");
+            let is_stop = |t: u32| self.tok.is_stop_token(t) || req.stop_tokens.contains(&t);
+            let leg = {
+                let _admit = match proc_guard.take() {
+                    Some(g) => g,
+                    None => b.admit_lock.lock().unwrap(),
+                };
+                client.admit(
+                    &cmd,
+                    None,
+                    &prompt,
+                    cancel,
+                    &mut |t, lp| {
+                        if is_stop(t) && !req.sampling.ignore_eos {
+                            false
+                        } else {
+                            on_token(t, lp)
+                        }
+                    },
+                    on_progress,
+                )?
             };
-            client.admit(
-                &cmd,
-                None,
+            if leg.cancelled {
+                // The consumer left during admission: the machinery already `BSTOP`ped
+                // the slot (if it continued) and handed its lines to the router.
+                return Ok(composed(
+                    &carry,
+                    EngineTimings {
+                        cache_n: leg.reused,
+                        prompt_n: leg.prompt_n,
+                        prompt_ms: leg.prompt_ms,
+                        predicted_n: 0,
+                        predicted_ms: 0.5,
+                        draft_n: None,
+                        draft_accepted: None,
+                        finish_reason: if leg.finish == "stop" {
+                            "stop".to_string()
+                        } else {
+                            "cancel".to_string()
+                        },
+                    },
+                ));
+            }
+            if !leg.cont {
+                // The admission consumed the whole leg. Its token rides `on_token`
+                // already - either yielded, or suppressed as a stop token, which then
+                // does not count as predicted.
+                return Ok(composed(
+                    &carry,
+                    EngineTimings {
+                        cache_n: leg.reused,
+                        prompt_n: leg.prompt_n,
+                        prompt_ms: leg.prompt_ms,
+                        predicted_n: leg
+                            .admission
+                            .into_iter()
+                            .count()
+                            .saturating_sub(if leg.finish == "stop" { 1 } else { 0 }),
+                        predicted_ms: 0.5,
+                        draft_n: None,
+                        draft_accepted: None,
+                        finish_reason: if leg.finish.is_empty() {
+                            "length".to_string()
+                        } else {
+                            leg.finish
+                        },
+                    },
+                ));
+            }
+            let emitted: Vec<u32> = leg.admission.into_iter().collect();
+            let slot = leg.slot;
+            let emitted_before = emitted_total;
+            // The pull-back mirror of `pump_slot`'s predicate.
+            let pullable = b.parallel_solo.load(Ordering::Relaxed)
+                && req.embeddings.is_none()
+                && b.slot_cache.load(Ordering::Relaxed)
+                && pulls < SOLO_AGAIN_MAX;
+            let pull_back: PullBack<'_> = if pullable {
+                Some(Box::new(|em: &[u32]| {
+                    req.max_new_tokens.saturating_sub(emitted_before + em.len())
+                        >= SOLO_AGAIN_MIN_LEFT
+                        && b.bus.only_busy_is(slot)
+                        && b.waiters.count() == 0
+                }))
+            } else {
+                None
+            };
+            let res = client.pump(
+                leg.slot,
                 &prompt,
+                &emitted,
                 cancel,
-                &mut |t, lp| {
+                &mut |t| {
                     if is_stop(t) && !req.sampling.ignore_eos {
-                        false
+                        false // suppressed, as the solo path suppresses it: the slot ends here
                     } else {
-                        on_token(t, lp)
+                        on_token(t, None)
                     }
                 },
-                on_progress,
-            )?
-        };
-        if leg.cancelled {
-            // The consumer left during admission: the machinery already `BSTOP`ped the slot (if
-            // it continued) and handed its lines to the router. Nothing left to read.
-            return Ok(with_carry(EngineTimings {
+                pull_back.as_deref(),
+            )?;
+            // The engine's `produced` counts the stop token the solo path suppresses
+            // (their #1869's slot end is that same token); a cancelled leg absorbs its
+            // last tokens unreported.
+            let suppressed = match res.finish.as_str() {
+                "stop" | "abort" => 1,
+                _ => 0,
+            };
+            let timings = EngineTimings {
                 cache_n: leg.reused,
                 prompt_n: leg.prompt_n,
                 prompt_ms: leg.prompt_ms,
-                predicted_n: 0,
-                predicted_ms: 0.5,
+                predicted_n: res.produced.saturating_sub(suppressed),
+                predicted_ms: res.decode_ms.max(0.5),
                 draft_n: None,
                 draft_accepted: None,
-                finish_reason: if leg.finish == "stop" {
+                finish_reason: if res.finish == "abort" {
                     "stop".to_string()
                 } else {
-                    "cancel".to_string()
+                    res.finish.clone()
                 },
-            }));
-        }
-        if !leg.cont {
-            // The admission consumed the whole leg. Its token rides `on_token` already - either
-            // yielded, or suppressed as a stop token, which then does not count as predicted.
-            return Ok(with_carry(EngineTimings {
-                cache_n: leg.reused,
-                prompt_n: leg.prompt_n,
-                prompt_ms: leg.prompt_ms,
-                predicted_n: leg
-                    .admission
-                    .into_iter()
-                    .count()
-                    .saturating_sub(if leg.finish == "stop" { 1 } else { 0 }),
-                predicted_ms: 0.5,
-                draft_n: None,
-                draft_accepted: None,
-                finish_reason: if leg.finish.is_empty() {
-                    "length".to_string()
-                } else {
-                    leg.finish
-                },
-            }));
-        }
-        let emitted: Vec<u32> = leg.admission.into_iter().collect();
-        let res = client.pump(leg.slot, &prompt, &emitted, cancel, &mut |t| {
-            if is_stop(t) && !req.sampling.ignore_eos {
-                false // suppressed, as the solo path suppresses it: the slot ends here
-            } else {
-                on_token(t, None)
+            };
+            if res.pulled_back
+                && res.finish == "cancel"
+                && !cancel.load(Ordering::Relaxed)
+                && emitted_before + res.emitted.len() < req.max_new_tokens
+            {
+                carry.push(timings);
+                emitted_total += res.emitted.len();
+                prompt.extend(res.emitted);
+                pulls += 1;
+                continue;
             }
-        })?;
-        // The engine's `produced` counts the stop token the solo path suppresses (their #1869's
-        // slot end is that same token); a cancelled leg absorbs its last tokens unreported.
-        let suppressed = match res.finish.as_str() {
-            "stop" | "abort" => 1,
-            _ => 0,
-        };
-        Ok(with_carry(EngineTimings {
-            cache_n: leg.reused,
-            prompt_n: leg.prompt_n,
-            prompt_ms: leg.prompt_ms,
-            predicted_n: res.produced.saturating_sub(suppressed),
-            predicted_ms: res.decode_ms.max(0.5),
-            draft_n: None,
-            draft_accepted: None,
-            finish_reason: if res.finish == "abort" {
-                "stop".to_string()
-            } else {
-                res.finish
-            },
-        }))
+            return Ok(composed(&carry, timings));
+        }
     }
 
     /// One solo leg on the mock's control lines - the mirror of `generate_on` the batch mock
@@ -2205,6 +2260,18 @@ impl EngineBus {
         !self.inner.lock().unwrap().slot.iter().any(|st| st.busy)
     }
 
+    /// True when `slot` alone is busy: server.py's `sum(self.slot_busy) == 1`, read by
+    /// the pull-back - the asking slot's window may end because nothing else is
+    /// decoding beside it, and no admission is queued for the control lines.
+    pub(crate) fn only_busy_is(&self, slot: usize) -> bool {
+        let g = self.inner.lock().unwrap();
+        g.slot.get(slot).is_some_and(|st| st.busy)
+            && g.slot
+                .iter()
+                .enumerate()
+                .all(|(i, st)| i == slot || !st.busy)
+    }
+
     /// Claim a slot chosen among the free ones by `pick`. The park sweep and the #1603
     /// orphan-age fallback are the machinery behind every claim, shared: `pick` sees
     /// the free slots - index, held conversation, and the claim-sequence stamp of their last
@@ -2503,6 +2570,37 @@ pub(crate) enum SoloOutcome {
     },
 }
 
+/// How a slot leg ended. `PulledBack` is server.py's `_may_go_solo`: the slot found
+/// itself alone - no other slot decoding, nobody waiting - ended its window on request,
+/// and the request continues on the solo path with the engine's drafts. The leg's
+/// tokens ride back for the next leg's prompt, as the eviction's do.
+pub(crate) enum SlotOutcome {
+    Done(EngineTimings),
+    PulledBack {
+        emitted: Vec<u32>,
+        timings: EngineTimings,
+    },
+}
+
+/// The pump's pull-back check, owned form (see `crate::batch::BatchClient::pump`).
+type PullBack<'a> = Option<Box<dyn Fn(&[u32]) -> bool + 'a>>;
+
+/// How often one request may pull its slot leg back to the solo path (server.py's
+/// `SOLO_AGAIN_MAX`).
+const SOLO_AGAIN_MAX: usize = 2;
+/// ... and only while this many tokens of the request are still unspent (server.py's
+/// `SOLO_AGAIN_MIN_LEFT`): a short tail is not worth the hand-over's re-prompt.
+const SOLO_AGAIN_MIN_LEFT: usize = 32;
+
+/// #1869's carry over a run of legs: see `compose_legs` for the rule; folding it in
+/// either direction agrees (sums, maxima, last-leg fields), so hand-over legs ride
+/// back as one vector and compose the same either way.
+fn compose_legs_all(legs: &[EngineTimings], last: EngineTimings) -> EngineTimings {
+    legs.iter()
+        .rev()
+        .fold(last, |acc, leg| compose_legs(leg, acc))
+}
+
 /// #1869's composition: a request whose first leg ended in a hand-over reports one total -
 /// the decode figures sum across legs, the prompt time is the bigger read's (the second leg
 /// re-reads through the engine's caches, and what it did reuse is its own `cache_n`), and the
@@ -2688,11 +2786,29 @@ impl StdioSubprocessEngine {
         evict: Option<&dyn Fn() -> bool>,
     ) -> Result<SoloOutcome, EngineError> {
         let handle = self.running(slot)?;
-        let mut res = self.generate_on(handle, req, cancel.clone(), on_token, on_progress, evict);
+        let mut res = self.generate_on(
+            handle,
+            req,
+            &req.prompt_ids,
+            req.max_new_tokens,
+            cancel.clone(),
+            on_token,
+            on_progress,
+            evict,
+        );
         self.settle_after_error(slot, res.as_ref().err());
         if never_reached_engine(res.as_ref().err()) {
             let handle = self.running(slot)?;
-            res = self.generate_on(handle, req, cancel.clone(), on_token, on_progress, evict);
+            res = self.generate_on(
+                handle,
+                req,
+                &req.prompt_ids,
+                req.max_new_tokens,
+                cancel.clone(),
+                on_token,
+                on_progress,
+                evict,
+            );
             self.after_resend(slot, res.as_ref().err());
         }
         res
@@ -3194,21 +3310,25 @@ impl StdioSubprocessEngine {
         &self,
         handle: &mut SubprocessHandle,
         req: &GenerateRequest,
+        prompt: &[u32],
+        max_new: usize,
         cancel: Arc<AtomicBool>,
         on_token: &mut dyn FnMut(u32, Option<TokenLogprob>) -> bool,
         on_progress: &mut dyn FnMut(usize, usize),
         evict: Option<&dyn Fn() -> bool>,
     ) -> Result<SoloOutcome, EngineError> {
-        let (keys, frame, csv_ids) = self.gen_body(req, &req.prompt_ids);
+        let (keys, frame, csv_ids) = self.gen_body(req, prompt);
         let cmd = match &req.embeddings {
             Some(path) => match &req.img_keys {
-                Some(k) => format!(
-                    "GENI {}{} img_keys={} {} {}\n",
-                    req.max_new_tokens, keys, k, path, csv_ids
-                ),
-                None => format!("GENI {}{} {} {}\n", req.max_new_tokens, keys, path, csv_ids),
+                Some(k) => {
+                    format!(
+                        "GENI {}{} img_keys={} {} {}\n",
+                        max_new, keys, k, path, csv_ids
+                    )
+                }
+                None => format!("GENI {}{} {} {}\n", max_new, keys, path, csv_ids),
             },
-            None => format!("GEN {}{} {}\n", req.max_new_tokens, keys, csv_ids),
+            None => format!("GEN {}{} {}\n", max_new, keys, csv_ids),
         };
         {
             let mut stdin = handle.stdin.lock().unwrap();
@@ -3425,9 +3545,11 @@ impl StdioSubprocessEngine {
         leg: Leg,
         req: &GenerateRequest,
         prompt: &[u32],
+        emitted_before: usize,
+        pulls: usize,
         cancel: &Arc<AtomicBool>,
         on_token: &mut dyn FnMut(u32, Option<TokenLogprob>) -> bool,
-    ) -> Result<EngineTimings, EngineError> {
+    ) -> Result<SlotOutcome, EngineError> {
         let client = BatchClient {
             bus,
             sink,
@@ -3435,14 +3557,53 @@ impl StdioSubprocessEngine {
         };
         let emitted: Vec<u32> = leg.admission.into_iter().collect();
         let is_stop = |t: u32| self.tok.is_stop_token(t) || req.stop_tokens.contains(&t);
-        let res = client.pump(leg.slot, prompt, &emitted, cancel, &mut |t| {
-            if is_stop(t) && !req.sampling.ignore_eos {
-                false
-            } else {
-                on_token(t, None)
-            }
-        })?;
-        self.slot_timings(&leg, res.produced, res.decode_ms, &res.finish, cancel)
+        // server.py's `_may_go_solo`: a slot that finds itself alone ends its window and
+        // lets the request continue on the solo path, where the MTP drafts run. Not for
+        // pictures (the image is re-read into the slot's session), not past
+        // SOLO_AGAIN_MAX pulls, not with a short tail of the request unspent, and only
+        // while the engine keeps slot sessions cached (`INFO slot_cache=`).
+        let slot = leg.slot;
+        let pullable = self.parallel_solo.load(Ordering::Relaxed)
+            && req.embeddings.is_none()
+            && self.slot_cache()
+            && pulls < SOLO_AGAIN_MAX;
+        let pull_back: PullBack<'_> = if pullable {
+            Some(Box::new(move |em: &[u32]| {
+                req.max_new_tokens.saturating_sub(emitted_before + em.len()) >= SOLO_AGAIN_MIN_LEFT
+                    && bus.only_busy_is(slot)
+                    && self.waiters.count() == 0
+            }))
+        } else {
+            None
+        };
+        let res = client.pump(
+            leg.slot,
+            prompt,
+            &emitted,
+            cancel,
+            &mut |t| {
+                if is_stop(t) && !req.sampling.ignore_eos {
+                    false
+                } else {
+                    on_token(t, None)
+                }
+            },
+            pull_back.as_deref(),
+        )?;
+        let timings = self.slot_timings(&leg, res.produced, res.decode_ms, &res.finish, cancel)?;
+        // The hand-over reads as one only if the engine ended the window the pull-back
+        // asked for: a `cancel` the consumer did not cause, with the request unspent.
+        if res.pulled_back
+            && res.finish == "cancel"
+            && !cancel.load(Ordering::Relaxed)
+            && emitted_before + res.emitted.len() < req.max_new_tokens
+        {
+            return Ok(SlotOutcome::PulledBack {
+                emitted: res.emitted,
+                timings,
+            });
+        }
+        Ok(SlotOutcome::Done(timings))
     }
 
     /// A slot leg's figures in the solo path's `EngineTimings` shape: the admission's `DONE`
@@ -3697,22 +3858,38 @@ impl Engine for StdioSubprocessEngine {
             bus = handle.bus.clone();
             sink = StdinSink(handle.stdin.clone());
         }
-        // serve/server.py's solo-if-idle rule: a request that finds every slot free and
-        // nobody waiting takes the solo path - the fastest stream, no batch window to pay
-        // for - and an arrival's very queueing evicts it into one (its STOP goes out at the
-        // next token, and the leg continues as a BGEN of the prompt plus what it produced).
-        let mut carry: Option<EngineTimings> = None;
-        let mut grown: Option<Vec<u32>> = None;
-        if self.parallel_solo.load(Ordering::Relaxed) && req.max_new_tokens > 1 && bus.slots_idle()
-        {
-            let alone = self.waiters.count() == 0;
-            if alone {
+        // serve/server.py's two hand-overs: a request that finds the engine to itself
+        // (every slot free, nobody waiting) takes the solo path - the fastest stream, no
+        // batch window to pay for - and an arrival's very queueing evicts it into a slot
+        // (its STOP goes out at the next token, and the leg continues as a BGEN of the
+        // prompt plus what it produced). A slot leg that finds itself alone in turn ends
+        // its window and pulls back to the solo path, where the MTP drafts live
+        // (`_may_go_solo`). Each hand-over grows the prompt by what the leg emitted and
+        // cuts the budget by what it spent; the legs ride back as one exchange through
+        // #1869's carry rule.
+        let mut carry: Vec<EngineTimings> = Vec::new();
+        let mut emitted_total = 0usize;
+        let mut pulls = 0usize;
+        let mut prompt = req.prompt_ids.clone();
+        let composed = |legs: &[EngineTimings], t: Result<EngineTimings, EngineError>| match t {
+            Ok(last) if !legs.is_empty() => Ok(compose_legs_all(legs, last)),
+            t => t,
+        };
+        loop {
+            let left = req.max_new_tokens.saturating_sub(emitted_total);
+            if self.parallel_solo.load(Ordering::Relaxed)
+                && left > 1
+                && bus.slots_idle()
+                && self.waiters.count() == 0
+            {
                 let evict = || self.waiters.count() > 0;
                 let outcome = {
                     let handle = self.running(&mut slot)?;
                     self.generate_on(
                         handle,
                         req,
+                        &prompt,
+                        left,
                         cancel.clone(),
                         on_token,
                         on_progress,
@@ -3726,6 +3903,8 @@ impl Engine for StdioSubprocessEngine {
                         self.generate_on(
                             handle,
                             req,
+                            &prompt,
+                            left,
                             cancel.clone(),
                             on_token,
                             on_progress,
@@ -3735,25 +3914,23 @@ impl Engine for StdioSubprocessEngine {
                     other => other,
                 };
                 match outcome {
+                    Ok(SoloOutcome::Done(t)) => return composed(&carry, Ok(t)),
                     Ok(SoloOutcome::Evicted { emitted, timings }) => {
                         // Python's checks before a promotion: the consumer left, or the
                         // exchange ended on its own along with (or before) the hand-over.
-                        let left = req.max_new_tokens.saturating_sub(emitted.len());
                         if cancel.load(Ordering::Relaxed) {
-                            return Ok(timings);
+                            return composed(&carry, Ok(timings));
                         }
-                        if left > 0 {
-                            carry = Some(timings);
-                            let mut p = req.prompt_ids.clone();
-                            p.extend(emitted);
-                            grown = Some(p);
-                        } else {
+                        let spent = emitted.len();
+                        if left.saturating_sub(spent) == 0 {
                             let mut t = timings;
                             t.finish_reason = "length".to_string();
-                            return Ok(t);
+                            return composed(&carry, Ok(t));
                         }
+                        carry.push(timings);
+                        emitted_total += spent;
+                        prompt.extend(emitted);
                     }
-                    Ok(SoloOutcome::Done(t)) => return Ok(t),
                     Err(e) => {
                         self.settle_after_error(&mut slot, Some(&e));
                         return Err(e);
@@ -3762,79 +3939,113 @@ impl Engine for StdioSubprocessEngine {
                 // The promoted leg continues into a slot with `proc` still held: Python
                 // likewise keeps the control lines across the promotion's admission.
             }
-        }
-        let prompt: &[u32] = grown.as_deref().unwrap_or(&req.prompt_ids);
-        // A leg's own budget: the engine stops a slot at its line's `max_new`, so the promoted
-        // admission gets what the solo leg left (serve/server.py's `left`).
-        let max_new = req
-            .max_new_tokens
-            .saturating_sub(grown.as_ref().map_or(0, |p| p.len() - req.prompt_ids.len()));
-        let composed = |t: Result<EngineTimings, EngineError>| match (&carry, t) {
-            (Some(first), Ok(last)) => Ok(compose_legs(first, last)),
-            (_, t) => t,
-        };
-        let mut res = self.admit_slot(
-            &bus,
-            &sink,
-            req,
-            prompt,
-            max_new,
-            &cancel,
-            on_token,
-            on_progress,
-        );
-        if never_reached_engine(res.as_ref().err()) {
-            self.settle_after_error(&mut slot, res.as_ref().err());
-            let handle = self.running(&mut slot)?;
-            bus = handle.bus.clone();
-            sink = StdinSink(handle.stdin.clone());
-            res = self.admit_slot(
+            // A leg's own budget: the engine stops a slot at its line's `max_new`, so each
+            // admission gets what the earlier legs left (serve/server.py's `left`).
+            let max_new = req.max_new_tokens.saturating_sub(emitted_total);
+            let mut res = self.admit_slot(
                 &bus,
                 &sink,
                 req,
-                prompt,
+                &prompt,
                 max_new,
                 &cancel,
                 on_token,
                 on_progress,
             );
-            self.after_resend(&mut slot, res.as_ref().err());
-        }
-        let leg = match res {
-            Ok(leg) => leg,
-            Err(e) => {
-                self.settle_after_error(&mut slot, Some(&e));
-                return Err(e);
+            if never_reached_engine(res.as_ref().err()) {
+                let handle = self.running(&mut slot)?;
+                bus = handle.bus.clone();
+                sink = StdinSink(handle.stdin.clone());
+                res = self.admit_slot(
+                    &bus,
+                    &sink,
+                    req,
+                    &prompt,
+                    max_new,
+                    &cancel,
+                    on_token,
+                    on_progress,
+                );
+                self.after_resend(&mut slot, res.as_ref().err());
             }
-        };
-        if leg.cancelled {
-            let produced = leg.admission.into_iter().count();
-            return composed(self.slot_timings(
-                &leg,
-                produced,
-                0.0,
-                if cancel.load(Ordering::Relaxed) {
-                    "cancel"
-                } else {
-                    "stop"
-                },
+            let leg = match res {
+                Ok(leg) => leg,
+                Err(e) => {
+                    self.settle_after_error(&mut slot, Some(&e));
+                    return Err(e);
+                }
+            };
+            if leg.cancelled {
+                let produced = leg.admission.into_iter().count();
+                return composed(
+                    &carry,
+                    self.slot_timings(
+                        &leg,
+                        produced,
+                        0.0,
+                        if cancel.load(Ordering::Relaxed) {
+                            "cancel"
+                        } else {
+                            "stop"
+                        },
+                        &cancel,
+                    ),
+                );
+            }
+            if !leg.cont {
+                let produced = leg.admission.into_iter().count();
+                let finish = leg.finish.clone();
+                return composed(
+                    &carry,
+                    self.slot_timings(&leg, produced, 0.0, &finish, &cancel),
+                );
+            }
+            // Let the engine go: the pump reads only the slot's routed lines.
+            let leg_slot = leg.slot;
+            drop(slot);
+            let res = self.pump_slot(
+                &bus,
+                &sink,
+                leg,
+                req,
+                &prompt,
+                emitted_total,
+                pulls,
                 &cancel,
-            ));
+                on_token,
+            );
+            let res = match res {
+                Ok(SlotOutcome::PulledBack { emitted, timings }) => {
+                    eprintln!(
+                        "[talus-server] slot {} pulled back to the solo path after {} tokens",
+                        leg_slot,
+                        emitted.len()
+                    );
+                    // The leg came back for the solo path's drafts. Re-run the policy
+                    // above, which alone decides whether the solo path is still free - as
+                    // Python's outer loop does on the pull-back's `break`.
+                    carry.push(timings);
+                    emitted_total += emitted.len();
+                    prompt.extend(emitted);
+                    pulls += 1;
+                    slot = self.lock_proc(&cancel)?;
+                    continue;
+                }
+                other => composed(
+                    &carry,
+                    other.map(|o| match o {
+                        SlotOutcome::Done(t) => t,
+                        // Unreachable without the hand-over above; the types still allow it.
+                        SlotOutcome::PulledBack { timings, .. } => timings,
+                    }),
+                ),
+            };
+            if matches!(res.as_ref().err(), Some(EngineError::EngineDied(_))) {
+                let mut slot = self.proc.lock().unwrap();
+                self.settle_after_error(&mut slot, res.as_ref().err());
+            }
+            return res;
         }
-        if !leg.cont {
-            let produced = leg.admission.into_iter().count();
-            let finish = leg.finish.clone();
-            return composed(self.slot_timings(&leg, produced, 0.0, &finish, &cancel));
-        }
-        // Let the engine go: the pump reads only the slot's routed lines.
-        drop(slot);
-        let res = self.pump_slot(&bus, &sink, leg, req, prompt, &cancel, on_token);
-        let res = composed(res);
-        if matches!(res.as_ref().err(), Some(EngineError::EngineDied(_))) {
-            let mut slot = self.proc.lock().unwrap();
-            self.settle_after_error(&mut slot, res.as_ref().err());
-        }
-        res
     }
 
     fn tokenize(&self, text: &str, parse_special: bool) -> Vec<u32> {

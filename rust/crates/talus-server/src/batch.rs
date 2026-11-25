@@ -82,11 +82,20 @@ pub(crate) struct Leg {
 }
 
 /// A slot leg's end, from its `BDONE` - or, when the consumer left, the last numbers it has.
+/// The borrowed form of the engine's pull-back check (see `PullBack` in `engine`).
+type PullBackRef<'a> = Option<&'a dyn Fn(&[u32]) -> bool>;
+
 #[derive(Debug)]
 pub(crate) struct Pumped {
     pub(crate) produced: usize,
     pub(crate) finish: String,
     pub(crate) decode_ms: f64,
+    /// The pump sent a `BSTOP` on the caller's pull-back request, not the consumer's:
+    /// the caller decides whether the `cancel` it then reads is that hand-over.
+    pub(crate) pulled_back: bool,
+    /// Every token of the leg - the admission's own and the `BT`s - for a hand-over's
+    /// continuation prompt.
+    pub(crate) emitted: Vec<u32>,
 }
 
 /// How often one request tries another slot after the engine refused a BGEN (server.py's #1994).
@@ -253,6 +262,10 @@ impl<'a> BatchClient<'a> {
     /// and reads for the `BDONE` up to `BDONE_AFTER_EOS` - the engine prints it in the same
     /// window as the stop token (their #1869) - falling back to releasing-inline when it does
     /// not come.
+    /// `pull_back`, checked after every accepted `BT`, answers whether the slot should
+    /// hand its leg back to the solo path (server.py's `_may_go_solo`): the pump then
+    /// ends the window with a `BSTOP` - a `cancel` the consumer did not cause - and
+    /// reports `pulled_back` with the leg's full token stream.
     pub(crate) fn pump(
         &self,
         slot: usize,
@@ -260,8 +273,10 @@ impl<'a> BatchClient<'a> {
         emitted: &[u32],
         cancel: &AtomicBool,
         on_token: &mut dyn FnMut(u32) -> bool,
+        pull_back: PullBackRef<'_>,
     ) -> Result<Pumped, EngineError> {
         let mut stop_sent = false;
+        let mut pulled_back = false;
         let mut emitted: Vec<u32> = emitted.to_vec();
         loop {
             match self.bus.recv_slot(slot, SLOT_TICK)? {
@@ -296,6 +311,15 @@ impl<'a> BatchClient<'a> {
                             }
                             return self.leave_slot(slot, prompt, &emitted, "abort");
                         }
+                        if !stop_sent
+                            && !pulled_back
+                            && pull_back.as_ref().is_some_and(|f| f(&emitted))
+                        {
+                            // Alone now: end the window so the leg can continue with the
+                            // solo path's drafts (server.py's `_may_go_solo`).
+                            self.sink.send(&format!("BSTOP {slot}"), None)?;
+                            pulled_back = true;
+                        }
                     } else if let Some(rest) = trimmed.strip_prefix("BDONE ") {
                         // `BDONE <slot> <produced> <finish> <decode_ms>`
                         let f: Vec<&str> = rest.split_whitespace().collect();
@@ -308,6 +332,8 @@ impl<'a> BatchClient<'a> {
                             produced,
                             finish,
                             decode_ms,
+                            pulled_back,
+                            emitted,
                         });
                     }
                     // INFO/WARN interleaving is not a slot's answer either.
@@ -357,6 +383,8 @@ impl<'a> BatchClient<'a> {
                             produced,
                             finish,
                             decode_ms,
+                            pulled_back: false,
+                            emitted: tail,
                         });
                     }
                 }
@@ -369,6 +397,8 @@ impl<'a> BatchClient<'a> {
             produced: emitted.len(),
             finish: why.to_string(),
             decode_ms: 0.0,
+            pulled_back: false,
+            emitted: emitted.to_vec(),
         })
     }
 
@@ -874,5 +904,99 @@ mod tests {
             b_elapsed < std::time::Duration::from_millis(500),
             "the solo leg did not give way: B waited {b_elapsed:?}"
         );
+    }
+
+    #[test]
+    fn a_slot_left_alone_pulls_its_leg_back_to_the_solo_path() {
+        let m = std::sync::Arc::new(mock(2));
+        m.set_parallel_solo(true);
+        m.set_batch_pace_ms(20);
+        // Script order on the wire: A's evicted `GEN`, A's promoted `BGEN` (which the
+        // pull-back ends with a `BSTOP` once B's slot frees), B's short `BGEN`, then
+        // A's pull-back `GEN` - which finishes the exchange on the control lines.
+        let a1: Vec<u32> = (200..230).collect();
+        let a2: Vec<u32> = (250..280).collect();
+        let a3: Vec<u32> = vec![400, 401, 402, ID_IM_END];
+        m.set_batch_scripts(vec![
+            a1.clone(),
+            a2.clone(),
+            vec![300, 301, 302],
+            a3.clone(),
+        ]);
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let a = {
+            let m = m.clone();
+            let seen = seen.clone();
+            std::thread::spawn(move || {
+                let mut toks = Vec::new();
+                let t = m
+                    .generate(
+                        &request(60),
+                        Arc::new(AtomicBool::new(false)),
+                        &mut |x| {
+                            toks.push(x);
+                            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            true
+                        },
+                        &mut |_, _| {},
+                    )
+                    .expect("the pulled-back request completes");
+                (toks, t)
+            })
+        };
+        let parked = std::time::Instant::now();
+        while seen.load(std::sync::atomic::Ordering::SeqCst) < 2
+            && parked.elapsed() < std::time::Duration::from_millis(300)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // B is the company A keeps in slots - and then leaves. Its leg is short, so
+        // A's slot is on its own well before A's window could end on its own.
+        let (b_toks, _) = run(&m, 4);
+        let (a_toks, a) = a.join().expect("A's thread lands");
+
+        // The hand-over point is timing's choice, not the test's; the third script is a
+        // disjoint range, so the consumer's stream shows exactly where the pull-back
+        // cut the slot window short.
+        let back = match a_toks.iter().position(|&t| t == 400) {
+            Some(c) => c,
+            None => panic!("no pull-back: stream={a_toks:?} finish={}", a.finish_reason),
+        };
+        // Where the eviction cut the solo leg is timing's choice (as in the eviction
+        // test), so the slot leg runs on a disjoint range; its own contiguity is what
+        // the pull-back must preserve.
+        assert_eq!(&a_toks[..2], &[200, 201], "the solo leg's tokens");
+        let m0 = match a_toks.iter().position(|&t| t == 250) {
+            Some(p) => p,
+            None => panic!("no slot leg; stream={a_toks:?}"),
+        };
+        assert!(
+            m0 >= 2,
+            "the slot leg ran before the solo leg ended: {a_toks:?}"
+        );
+        assert!(back > m0, "the slot leg produced nothing to continue");
+        assert!(
+            back - m0 < a2.len(),
+            "the slot window ended on its script, not the pull-back: {a_toks:?}"
+        );
+        for w in a_toks[m0..back].windows(2) {
+            if w[1] != w[0] + 1 {
+                panic!("slot leg not contiguous at {w:?}; stream={a_toks:?}");
+            }
+        }
+        assert_eq!(
+            &a_toks[back..back + 3],
+            &[400, 401, 402],
+            "the pull-back leg"
+        );
+        // The exchange ends with the pull-back leg, on the control lines: its stop
+        // token - suppressed, as ever - is the stream's last word.
+        assert_eq!(a.finish_reason, "stop");
+        assert_eq!(
+            &a_toks[..],
+            &a_toks[..back + 3],
+            "nothing after the stop token"
+        );
+        assert_eq!(b_toks, vec![300, 301, 302]);
     }
 }

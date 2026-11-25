@@ -1045,6 +1045,9 @@ pub(crate) struct MockBatch {
     /// Concurrent requests serialize on their admission, exactly as the real server's control
     /// handoff does: one `BGEN` answered on the control lines at a time.
     admit_lock: Arc<Mutex<()>>,
+    /// How often the control lines have been taken (server.py's `ctl_epoch`): a request
+    /// parked by a give-way (#656) watches it to know the requests waiting then went first.
+    admit_epoch: AtomicU64,
     /// A `STOP` that lands on the control lines while a solo (`GEN`) leg streams: the leg's
     /// thread ends it at its next token with a `cancel`-finished `DONE`. `solo_gen` is the
     /// leg's number: the `STOP` an admission races out (a finished leg's) clears only its own
@@ -1057,6 +1060,12 @@ pub(crate) struct MockBatch {
     /// The slot a running leg was asked to stop its prompt read into (`BYIELD`); -1
     /// when nobody asked. The leg threads consume it at their next read boundary.
     yield_slot: Arc<AtomicIsize>,
+    /// How quiet a mock leg goes before it asks to give way - the mock's stand-in for
+    /// `YIELD_POLL`, so the give-way test does not run at the real engine's half second.
+    yield_poll_ms: AtomicU64,
+    /// Whether the mock engine takes `BYIELD` at all - off mirrors the real engine's
+    /// gate refusing the park (`can` false): the line is consumed, no `YIELDED` comes.
+    yield_takes: AtomicBool,
     /// The solo-if-idle policy (`set_parallel_solo`; off by default in the mock, where every
     /// existing batch test scripts its request straight into a slot).
     parallel_solo: Arc<AtomicBool>,
@@ -1093,10 +1102,13 @@ impl ScriptedMockEngine {
             refusals: Arc::new(AtomicUsize::new(0)),
             stopped: Arc::new(Mutex::new(std::collections::HashSet::new())),
             admit_lock: Arc::new(Mutex::new(())),
+            admit_epoch: AtomicU64::new(0),
             solo_stop: Arc::new(AtomicBool::new(false)),
             solo_gen: Arc::new(AtomicUsize::new(0)),
             slot_cache: AtomicBool::new(true),
             yield_slot: Arc::new(AtomicIsize::new(-1)),
+            yield_poll_ms: AtomicU64::new(500),
+            yield_takes: AtomicBool::new(true),
             parallel_solo: Arc::new(AtomicBool::new(false)),
             waiters: Waiters::default(),
         });
@@ -1128,6 +1140,22 @@ impl ScriptedMockEngine {
     pub fn set_batch_pace_ms(&self, ms: u64) {
         if let Some(b) = self.batch.lock().unwrap().clone() {
             b.pace_ms.store(ms, Ordering::Relaxed);
+        }
+    }
+
+    /// How quiet a leg goes before it asks to give way (#656), in ms - the mock's
+    /// stand-in for `YIELD_POLL`, so a give-way test need not wait the real half second.
+    pub fn set_yield_poll_ms(&self, ms: u64) {
+        if let Some(b) = self.batch.lock().unwrap().clone() {
+            b.yield_poll_ms.store(ms, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether the mock engine honours `BYIELD`; off it swallows the line the way the
+    /// real engine's gate does, and the client's un-taken slot claim must come back.
+    pub fn set_yield_takes(&self, takes: bool) {
+        if let Some(b) = self.batch.lock().unwrap().clone() {
+            b.yield_takes.store(takes, Ordering::Relaxed);
         }
     }
 
@@ -1186,7 +1214,7 @@ impl ScriptedMockEngine {
             let left = req.max_new_tokens.saturating_sub(emitted_total);
             if b.parallel_solo.load(Ordering::Relaxed) && left > 1 && slot_hint.is_none() {
                 let ticket = b.waiters.register(prompt.len());
-                let mut guard = b.admit_lock.lock().unwrap();
+                let mut guard = mock_take_admit(&b);
                 drop(ticket);
                 if b.bus.slots_idle() && b.waiters.count() == 0 {
                     let evict = || b.waiters.count() > 0;
@@ -1231,8 +1259,8 @@ impl ScriptedMockEngine {
                             // The re-take behind the shorter waiters, as the real
                             // engine's does.
                             std::mem::drop(guard);
-                            let _t = b.waiters.register(prompt.len());
-                            guard = b.admit_lock.lock().unwrap();
+                            let _t = re_take_turn(&b.waiters, &b.admit_epoch, cancel, prompt.len());
+                            guard = mock_take_admit(&b);
                             drop(_t);
                             slot_hint = Some(reserved);
                         }
@@ -1270,7 +1298,7 @@ impl ScriptedMockEngine {
                 // (#1603); the give-way question rides `admit` (#656).
                 let mut admit_guard = proc_guard.take();
                 if slot_hint.is_some() && admit_guard.is_none() {
-                    admit_guard = Some(b.admit_lock.lock().unwrap());
+                    admit_guard = Some(mock_take_admit(&b));
                 }
                 let r = client.admit(
                     &cmd,
@@ -1285,7 +1313,7 @@ impl ScriptedMockEngine {
                         };
                         if let Some(s) = picker.try_pick(&prompt) {
                             if admit_guard.is_none() {
-                                admit_guard = Some(b.admit_lock.lock().unwrap());
+                                admit_guard = Some(mock_take_admit(&b));
                             }
                             return Ok(s);
                         }
@@ -1299,7 +1327,7 @@ impl ScriptedMockEngine {
                             }
                             b.bus.wait_slot(crate::batch::CLAIM_WAIT);
                         };
-                        admit_guard = Some(b.admit_lock.lock().unwrap());
+                        admit_guard = Some(mock_take_admit(&b));
                         Ok(s)
                     },
                     Some(&|| {
@@ -1339,8 +1367,8 @@ impl ScriptedMockEngine {
                         },
                     ));
                 }
-                let _t = b.waiters.register(prompt.len());
-                proc_guard = Some(b.admit_lock.lock().unwrap());
+                let _t = re_take_turn(&b.waiters, &b.admit_epoch, cancel, prompt.len());
+                proc_guard = Some(mock_take_admit(&b));
                 drop(_t);
                 slot_hint = Some(leg.slot);
                 continue;
@@ -1496,8 +1524,23 @@ impl ScriptedMockEngine {
                 sink.send("STOP", None)?;
                 stop_sent = true;
             }
-            let Some(line) = b.bus.recv()? else {
-                return Err(EngineError::EngineDied("the mock engine ended".to_string()));
+            let poll = Duration::from_millis(b.yield_poll_ms.load(Ordering::Relaxed));
+            let line = match b.bus.recv_ctl(Some(poll))? {
+                BusLine::Line(line) => line,
+                BusLine::TimedOut => {
+                    // The mirror of `generate_on`'s quiet tick: the mock's own read
+                    // goes silent between its paced chunks.
+                    if reserved.is_none() && emitted.is_empty() && !stop_sent {
+                        if let Some(s) = yield_way.as_ref().and_then(|f| f()) {
+                            sink.send(&format!("BYIELD {s}"), None)?;
+                            reserved = Some(s);
+                        }
+                    }
+                    continue;
+                }
+                BusLine::Ended => {
+                    return Err(EngineError::EngineDied("the mock engine ended".to_string()));
+                }
             };
             let trimmed = line.trim();
             if let Some(rest) = trimmed.strip_prefix("RESUME ") {
@@ -1518,7 +1561,9 @@ impl ScriptedMockEngine {
                     }
                 }
             } else if let Some(rest) = trimmed.strip_prefix("YIELDED ") {
+                // <slot> <tokens read>: the engine took the give-way, into the slot it names.
                 let f: Vec<&str> = rest.split_whitespace().collect();
+                reserved = f.first().and_then(|x| x.parse::<usize>().ok());
                 yielded = f.get(1).and_then(|x| x.parse::<usize>().ok());
             } else if let Some(rest) = trimmed.strip_prefix("T ") {
                 let Ok(tok) = rest.trim().parse::<u32>() else {
@@ -1586,12 +1631,20 @@ impl ScriptedMockEngine {
                         timings,
                     });
                 }
+                // Mirror of `generate_on`: a `BYIELD` the mock's engine ignored leaves a
+                // claim on the reserved slot, and that claim goes back here.
+                if let Some(s) = reserved {
+                    b.bus.release_claim(s);
+                }
                 return if handover {
                     Ok(SoloOutcome::Evicted { emitted, timings })
                 } else {
                     Ok(SoloOutcome::Done(timings))
                 };
             } else if trimmed.starts_with("ERR") {
+                if let Some(s) = reserved {
+                    b.bus.release_claim(s);
+                }
                 return Err(EngineError::InvalidRequest(
                     trimmed.trim_start_matches("ERR").trim().to_string(),
                 ));
@@ -1693,9 +1746,12 @@ fn mock_batch_responder(rx: mpsc::Receiver<String>, b: Arc<MockBatch>) {
             "BYIELD" => {
                 // The read's own request asks it to stop at its next boundary and
                 // park the part read in the named slot (#656); the leg threads
-                // answer it there.
+                // answer it there. With `yield_takes` off the line is consumed
+                // without effect - the real engine's gate refusing the park.
                 if let Some(s) = w.next().and_then(|x| x.parse::<isize>().ok()) {
-                    b.yield_slot.store(s, Ordering::SeqCst);
+                    if b.yield_takes.load(Ordering::Relaxed) {
+                        b.yield_slot.store(s, Ordering::SeqCst);
+                    }
                 }
             }
             "STOP" => {
@@ -2538,6 +2594,18 @@ impl EngineBus {
         }
     }
 
+    /// Give back a `try_pick` claim whose request never reached the slot at all - the
+    /// engine ignored its `BYIELD` (#656), so the park never happened and the slot's
+    /// held conversation stays exactly as it was.
+    pub(crate) fn release_claim(&self, slot: usize) {
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(st) = guard.slot.get_mut(slot) {
+            st.busy = false;
+            st.claimed = false;
+        }
+        self.signal.notify_all();
+    }
+
     /// A slot whose BDONE its own request read: free, holding `held`.
     pub(crate) fn release_done(&self, slot: usize, held: Vec<u32>) {
         let mut guard = self.inner.lock().unwrap();
@@ -2731,6 +2799,35 @@ impl Drop for Waiter<'_> {
     }
 }
 
+/// The re-take after a give-way (#656; server.py's `after_epoch`): the request that
+/// parked re-registers and waits out the requests that were waiting then - until another
+/// admission has taken the control lines since the snapshot, or until no one else waits.
+/// The returned ticket deregisters when the caller's re-take holds the lines.
+fn re_take_turn<'w>(
+    waiters: &'w Waiters,
+    epoch: &AtomicU64,
+    cancel: &AtomicBool,
+    plen: usize,
+) -> Waiter<'w> {
+    let ticket = waiters.register(plen);
+    let seen = epoch.load(Ordering::SeqCst);
+    while epoch.load(Ordering::SeqCst) == seen
+        && waiters.count() > 1
+        && !cancel.load(Ordering::Relaxed)
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    ticket
+}
+
+/// A mock control-line take: counts the take like `lock_proc`, so a parked re-take can
+/// see the lines move.
+fn mock_take_admit(b: &MockBatch) -> std::sync::MutexGuard<'_, ()> {
+    let guard = b.admit_lock.lock().unwrap();
+    b.admit_epoch.fetch_add(1, Ordering::SeqCst);
+    guard
+}
+
 /// How a control-line leg ended. `Evicted` is the solo-if-idle hand-over: the engine's `STOP`
 /// went out at a token because an arrival queued behind the leg, and the request continues in
 /// a batch slot with its prompt plus everything the consumer was given.
@@ -2835,6 +2932,9 @@ pub struct StdioSubprocessEngine {
     /// Requests waiting for the control lines, watched by a running solo leg and by the
     /// solo-if-idle decision (see [`Waiters`]).
     waiters: Waiters,
+    /// How often `proc` has been taken (server.py's `ctl_epoch`): a request parked by a
+    /// give-way (#656) watches it to know the requests waiting then went first.
+    admit_epoch: AtomicU64,
     /// Whether a request that finds the engine alone runs on the solo path (`parallel_solo`).
     parallel_solo: AtomicBool,
 }
@@ -2953,12 +3053,17 @@ impl StdioSubprocessEngine {
     ) -> Result<std::sync::MutexGuard<'_, Option<SubprocessHandle>>, EngineError> {
         loop {
             match self.proc.try_lock() {
-                Ok(guard) => return Ok(guard),
+                Ok(guard) => {
+                    self.admit_epoch.fetch_add(1, Ordering::SeqCst);
+                    return Ok(guard);
+                }
                 Err(std::sync::TryLockError::WouldBlock) => {}
                 // Poisoned (a leg panicked holding it - the old code unwrapped through that
                 // too): take it the blocking way, which is what unwrap did.
                 Err(std::sync::TryLockError::Poisoned(_)) => {
-                    return Ok(self.proc.lock().unwrap());
+                    let guard = self.proc.lock().unwrap();
+                    self.admit_epoch.fetch_add(1, Ordering::SeqCst);
+                    return Ok(guard);
                 }
             }
             if cancel.load(Ordering::Relaxed) {
@@ -2990,6 +3095,7 @@ impl StdioSubprocessEngine {
             on_progress,
             evict,
             None,
+            crate::batch::YIELD_POLL,
         );
         self.settle_after_error(slot, res.as_ref().err());
         if never_reached_engine(res.as_ref().err()) {
@@ -3004,6 +3110,7 @@ impl StdioSubprocessEngine {
                 on_progress,
                 evict,
                 None,
+                crate::batch::YIELD_POLL,
             );
             self.after_resend(slot, res.as_ref().err());
         }
@@ -3064,6 +3171,7 @@ impl StdioSubprocessEngine {
             crash: Mutex::new(CrashState::default()),
             busy: AtomicUsize::new(0),
             waiters: Waiters::default(),
+            admit_epoch: AtomicU64::new(0),
             parallel_solo: AtomicBool::new(true),
         };
         engine.install(&mut engine.proc.lock().unwrap(), handle);
@@ -3518,6 +3626,7 @@ impl StdioSubprocessEngine {
         on_progress: &mut dyn FnMut(usize, usize),
         evict: Option<&dyn Fn() -> bool>,
         yield_way: Option<&dyn Fn() -> Option<usize>>,
+        yield_poll: Duration,
     ) -> Result<SoloOutcome, EngineError> {
         let (keys, frame, csv_ids) = self.gen_body(req, prompt);
         let cmd = match &req.embeddings {
@@ -3566,14 +3675,34 @@ impl StdioSubprocessEngine {
                 }
                 stop_sent = true;
             }
-            let Some(line) = handle.bus.recv()? else {
-                // no word from the engine right after the write: it was on its way out when the command arrived
-                let resend = !answered && written_at.elapsed() <= RESEND_WINDOW;
-                return Err(EngineError::EngineDied(if resend {
-                    ENDED_BEFORE_ANSWERING.to_string()
-                } else {
-                    "the engine process ended unexpectedly".to_string()
-                }));
+            let line = match handle.bus.recv_ctl(Some(yield_poll))? {
+                BusLine::Line(line) => line,
+                BusLine::TimedOut => {
+                    // The engine has been quiet. A real engine's chunked read reports
+                    // nothing until it ends, so this quiet tick - server.py's `_control`
+                    // heartbeat, the twin of its `on_quiet` - is where a waiting shorter
+                    // request asks the read to stop into a slot (#656). The engine takes
+                    // it at its next chunk boundary.
+                    if reserved.is_none() && emitted.is_empty() && !stop_sent {
+                        if let Some(s) = yield_way.as_ref().and_then(|f| f()) {
+                            if let Ok(mut stdin) = handle.stdin.lock() {
+                                let _ = stdin.write_all(format!("BYIELD {s}\n").as_bytes());
+                                let _ = stdin.flush();
+                            }
+                            reserved = Some(s);
+                        }
+                    }
+                    continue;
+                }
+                BusLine::Ended => {
+                    // no word from the engine right after the write: it was on its way out when the command arrived
+                    let resend = !answered && written_at.elapsed() <= RESEND_WINDOW;
+                    return Err(EngineError::EngineDied(if resend {
+                        ENDED_BEFORE_ANSWERING.to_string()
+                    } else {
+                        "the engine process ended unexpectedly".to_string()
+                    }));
+                }
             };
             let trimmed = line.trim();
             if trimmed.is_empty() {
@@ -3605,7 +3734,9 @@ impl StdioSubprocessEngine {
                     }
                 }
             } else if let Some(rest) = trimmed.strip_prefix("YIELDED ") {
+                // <slot> <tokens read>: the engine took the give-way, into the slot it names.
                 let f: Vec<&str> = rest.split_whitespace().collect();
+                reserved = f.first().and_then(|x| x.parse::<usize>().ok());
                 yielded = f.get(1).and_then(|x| x.parse::<usize>().ok());
             } else if let Some(rest) = trimmed.strip_prefix("T ") {
                 let lp = pending_lp.take();
@@ -3694,11 +3825,21 @@ impl StdioSubprocessEngine {
                         timings,
                     });
                 }
+                // The engine was asked to stop this read and never answered `YIELDED` -
+                // its gate refused the park, or the read ended first - so the reserved
+                // slot's claim goes back; nothing was parked in it (#656).
+                if let Some(s) = reserved {
+                    handle.bus.release_claim(s);
+                }
                 if evict_handover {
                     return Ok(SoloOutcome::Evicted { emitted, timings });
                 }
                 return Ok(SoloOutcome::Done(timings));
             } else if let Some(rest) = trimmed.strip_prefix("ERR") {
+                // Same as the `DONE` arm: a refused read still owes an un-taken claim back.
+                if let Some(s) = reserved {
+                    handle.bus.release_claim(s);
+                }
                 return Err(EngineError::InvalidRequest(rest.trim().to_string()));
             }
         }
@@ -4212,6 +4353,7 @@ impl Engine for StdioSubprocessEngine {
                         on_progress,
                         Some(&evict),
                         Some(&|| self.solo_yields_to(&bus, &sink, req, &prompt, yields)),
+                        crate::batch::YIELD_POLL,
                     )
                 };
                 let outcome = match outcome {
@@ -4228,6 +4370,7 @@ impl Engine for StdioSubprocessEngine {
                             on_progress,
                             Some(&evict),
                             Some(&|| self.solo_yields_to(&bus, &sink, req, &prompt, yields)),
+                            crate::batch::YIELD_POLL,
                         )
                     }
                     other => other,
@@ -4256,7 +4399,8 @@ impl Engine for StdioSubprocessEngine {
                         // already queued - the shorter ones it yielded to admit
                         // first - before the read goes on in its slot.
                         std::mem::drop(slot.take());
-                        let _t = self.waiters.register(prompt.len());
+                        let _t =
+                            re_take_turn(&self.waiters, &self.admit_epoch, &cancel, prompt.len());
                         slot = match self.lock_proc(&cancel) {
                             Ok(g) => Some(g),
                             Err(e) => {
@@ -4352,7 +4496,7 @@ impl Engine for StdioSubprocessEngine {
                     );
                 }
                 std::mem::drop(slot.take());
-                let _t = self.waiters.register(prompt.len());
+                let _t = re_take_turn(&self.waiters, &self.admit_epoch, &cancel, prompt.len());
                 slot = match self.lock_proc(&cancel) {
                     Ok(g) => Some(g),
                     Err(e) => {

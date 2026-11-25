@@ -107,6 +107,10 @@ const BGEN_REFUSALS_MAX: usize = 6;
 /// How long the control queue may stay quiet before a cancelled admission's `STOP` goes out
 /// (server.py's 0.5 s poll).
 const CTL_POLL: Duration = Duration::from_millis(500);
+/// How often a leg asks a silent engine's read to give way to a shorter waiting request
+/// (#656): a real engine's chunked read reports nothing until it ends, so server.py's
+/// `_control` quiet tick - half a second of silence - is the give-way's only signal there.
+pub(crate) const YIELD_POLL: Duration = Duration::from_millis(500);
 /// The slot queue's heartbeat cadence while pumping, when to check for a cancel (server.py's 10 s).
 const SLOT_TICK: Duration = Duration::from_secs(10);
 /// The wait for a leaving slot's `BDONE` right behind its stop token (server.py's #1869).
@@ -178,6 +182,12 @@ impl<'a> BatchClient<'a> {
                         if (cancel.load(Ordering::Relaxed) || aborted) && !stop_sent {
                             self.sink.send("STOP", None)?;
                             stop_sent = true;
+                        }
+                        // The same quiet tick as `generate_on`'s: the real engine's read
+                        // says nothing while it runs its chunks (#656).
+                        if !asked && leg.admission.is_none() && yield_way.is_some_and(|f| f()) {
+                            self.sink.send(&format!("BYIELD {slot}"), None)?;
+                            asked = true;
                         }
                     }
                     BusLine::Ended => {
@@ -1051,6 +1061,7 @@ mod tests {
         let m = std::sync::Arc::new(mock(2));
         m.set_parallel_solo(true);
         m.set_batch_pace_ms(20);
+        m.set_yield_poll_ms(5);
         // Script order on the wire: A's solo leg - whose tokens never reach the
         // consumer, the read parks before its first token - then the two slot
         // admissions: the short request's, and A's continuation in the slot its
@@ -1061,6 +1072,9 @@ mod tests {
             vec![200, 201, 202],
             vec![300, 301, 302, ID_IM_END],
             vec![500, 501, 502, ID_IM_END],
+            // A's continuation re-routed to the solo path when it finds its slot alone
+            // (the pull-back): the same tokens, through the next script.
+            vec![502, ID_IM_END],
         ]);
         let pps = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let a = {
@@ -1117,5 +1131,79 @@ mod tests {
         assert_eq!(a.finish_reason, "stop");
         let bus = m.batch_bus().expect("the mock's batch bus");
         assert!(bus.slots_idle(), "a claim leaked past the hand-over");
+    }
+
+    #[test]
+    fn a_dropped_byield_gives_its_slot_claim_back() {
+        // The engine can swallow a `BYIELD` - its gate refuses the park, or the read
+        // ends first - and answer plain `DONE`. The reserved slot was never a park
+        // then, and its claim must go back (#656), or the slot pool shrinks for good.
+        let m = std::sync::Arc::new(mock(2));
+        m.set_parallel_solo(true);
+        m.set_batch_pace_ms(20);
+        m.set_yield_poll_ms(5);
+        m.set_yield_takes(false);
+        let t0 = std::time::Instant::now();
+        // Scripts as in the parked test: A's solo leg, then the two slot admissions
+        // in wire order, then the pull-back's re-send. With `BYIELD` swallowed, A
+        // emits its first token on the solo path before the hand-over evicts it.
+        m.set_batch_scripts(vec![
+            vec![200, 201, 202],
+            vec![300, 301, 302, ID_IM_END],
+            vec![500, 501, 502, ID_IM_END],
+            vec![302, ID_IM_END],
+        ]);
+        let pps = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let a = {
+            let m = m.clone();
+            let pps = pps.clone();
+            std::thread::spawn(move || {
+                let mut toks = Vec::new();
+                let t = m
+                    .generate(
+                        &request_len(60, 40),
+                        Arc::new(AtomicBool::new(false)),
+                        &mut |x| {
+                            toks.push(x);
+                            true
+                        },
+                        &mut |_, _| {
+                            pps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        },
+                    )
+                    .expect("the swallowed request completes");
+                (toks, t)
+            })
+        };
+        let started = std::time::Instant::now();
+        while pps.load(std::sync::atomic::Ordering::SeqCst) < 1
+            && started.elapsed() < std::time::Duration::from_millis(500)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let (b_toks, _) = run(&m, 8);
+        let (a_toks, a) = a.join().expect("A's thread lands");
+
+        // A kept its solo token, both requests finish whole through the slot
+        // protocol - one riding the 300s script, the other the 500s - and the
+        // un-taken claim left no busy flag behind.
+        assert_eq!(a_toks.first(), Some(&200), "A's solo token: {a_toks:?}");
+        let (x, y): (Vec<u32>, Vec<u32>) = (vec![300, 301, 302], vec![500, 501, 502]);
+        let tail = &a_toks[1..];
+        assert!(
+            (tail == x && b_toks == y) || (tail == y && b_toks == x),
+            "the two requests did not split the slot scripts: A {a_toks:?} vs B {b_toks:?}"
+        );
+        assert_eq!(a.finish_reason, "stop");
+        let bus = m.batch_bus().expect("the mock's batch bus");
+        // The orphan reaper is the tell: with the claim given back, all three legs
+        // land at the mock's pace; with it leaked, the last claim waits out the
+        // 3 s orphan timeout (issue #1603) before the slots are idle again.
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "the exchange stalled {:?} - the claim was not given back",
+            t0.elapsed()
+        );
+        assert!(bus.slots_idle(), "a swallowed BYIELD leaked its slot claim");
     }
 }

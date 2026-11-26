@@ -2809,6 +2809,7 @@ fn re_take_turn<'w>(
     cancel: &AtomicBool,
     plen: usize,
 ) -> Waiter<'w> {
+    let t0 = std::time::Instant::now();
     let ticket = waiters.register(plen);
     let seen = epoch.load(Ordering::SeqCst);
     while epoch.load(Ordering::SeqCst) == seen
@@ -2816,6 +2817,26 @@ fn re_take_turn<'w>(
         && !cancel.load(Ordering::Relaxed)
     {
         std::thread::sleep(Duration::from_millis(50));
+    }
+    // a long park says so, naming the waiter's own size: a queue that never drains looks
+    // exactly like an engine that is merely busy until something prints.  STRATA_ADMIT_WARN_MS
+    // moves the bar (0 names every admission) while chasing a stall.
+    static ADMIT_WARN: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    let bar = *ADMIT_WARN.get_or_init(|| {
+        std::env::var("STRATA_ADMIT_WARN_MS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .map_or(Duration::from_secs(5), |ms| {
+                Duration::from_secs_f64(ms / 1000.0)
+            })
+    });
+    let waited = t0.elapsed();
+    if waited > bar {
+        eprintln!(
+            "[talus-server] admit: a {}-token request waited {:.1} s for the control lines",
+            plen,
+            waited.as_secs_f64()
+        );
     }
     ticket
 }

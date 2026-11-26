@@ -25,8 +25,13 @@ constexpr uint32_t kNpuN = 1024;
 constexpr int64_t kMaxGroups = 4;
 constexpr uint32_t kZCols = 6144;
 constexpr uint32_t kZSlicesMax = 6;
+constexpr uint32_t kQkvCols = 10240;
+constexpr uint32_t kQkvSlicesMax = 10;
+constexpr uint32_t kQkvAutoMax = 6;
+constexpr uint32_t kQkvPoolOffset = kZSlicesMax;  // C slots [6..15] kept disjoint from GDN Z [0..5]
 constexpr uint32_t kQCols = 12288;
 constexpr uint32_t kQSlicesMax = 12;
+constexpr uint32_t kPoolSlices = 16;  // >= max(kQSlicesMax, kZSlicesMax + kQkvSlicesMax)
 constexpr uint32_t kShexpCols = 640;
 constexpr size_t kReadyEventPoolSize = 256;
 
@@ -35,6 +40,14 @@ enum class OpKind : uint8_t {
     QsaQ = 1,
     ShexpGate = 2,
     ShexpUp = 3,
+    GdnQkv = 4,
+};
+
+enum class StatOp : uint8_t {
+    GdnQkv = 0,
+    GdnZ = 1,
+    QsaQ = 2,
+    Shexp = 3,
 };
 
 struct SliceKey {
@@ -82,19 +95,21 @@ struct PrefillNpu::Impl {
     int64_t min_t{2048};
     int64_t max_groups{kMaxGroups};
 
-    int z_slices_cfg{-1};  // -1 = auto
-    int q_slices_cfg{-1};  // -1 = auto
+    int qkv_slices_cfg{-1};  // -1 = auto
+    int z_slices_cfg{-1};    // -1 = auto
+    int q_slices_cfg{-1};    // -1 = auto
     bool shexp_on{true};
     bool auto_tune{true};
 
     // Active slice counts (may be adjusted by auto-tuner)
+    uint32_t qkv_slices{2};
     uint32_t z_slices{2};
     uint32_t q_slices{4};
 
     // Pooled A and C NPU buffers sized for up to `alloc_groups` groups of 4096 tokens
     int64_t alloc_groups{0};
     std::vector<int32_t> a_bufs;   // [alloc_groups]
-    std::vector<int32_t> c_pool;   // [alloc_groups * kQSlicesMax]
+    std::vector<int32_t> c_pool;   // [alloc_groups * kPoolSlices]
     const uint8_t** z_ptrs_host{nullptr};
     const uint8_t** z_ptrs_dev{nullptr};
     uint16_t* w_scratch_f16{nullptr};
@@ -105,15 +120,21 @@ struct PrefillNpu::Impl {
     // Active in-flight tracking for current half-layer
     std::atomic<bool> op_inflight{false};
     int64_t active_groups{0};
+    uint32_t active_qkv_gpu_cols{kQkvCols};
+    uint32_t active_qkv_slices{0};
     uint32_t active_z_gpu_cols{kZCols};
     uint32_t active_q_gpu_cols{kQCols};
     uint32_t active_q_slices{0};
+    int64_t cached_a_layer{-1};
+    int64_t cached_a_tn{0};
 
     // Auto-tune telemetry
     double last_wait_us{0.0};
     uint64_t last_waits{0};
     int gdn_calls_in_chunk{0};
     int qsa_calls_in_chunk{0};
+    double qkv_wait_us_accum{0.0};
+    int qkv_wait_samples{0};
     double gdn_wait_us_accum{0.0};
     int gdn_wait_samples{0};
     double qsa_wait_us_accum{0.0};
@@ -148,7 +169,7 @@ struct PrefillNpu::Impl {
             }
             a_bufs.push_back(a_id);
             const size_t c_bytes = talus_npu_c_bytes(ctx);
-            for (uint32_t s = 0; s < kQSlicesMax; ++s) {
+            for (uint32_t s = 0; s < kPoolSlices; ++s) {
                 int32_t c_id = talus_npu_alloc_buffer(ctx, c_bytes, err, sizeof(err));
                 if (c_id < 0) {
                     std::fprintf(stderr, "talus npu: alloc C failed: %s\n", err);
@@ -172,7 +193,7 @@ struct PrefillNpu::Impl {
         }
         for (int64_t g = 0; g < alloc_groups; ++g) {
             for (uint32_t s = 0; s < kZSlicesMax; ++s) {
-                const int32_t c_id = c_pool[static_cast<size_t>(g * kQSlicesMax + s)];
+                const int32_t c_id = c_pool[static_cast<size_t>(g * kPoolSlices + s)];
                 z_ptrs_host[g * kZSlicesMax + s] =
                     static_cast<const uint8_t*>(talus_npu_staged_ptr(ctx, c_id));
             }
@@ -244,7 +265,7 @@ struct PrefillNpu::Impl {
         return buf_id;
     }
 
-    void UpdateStatsDelta(bool is_gdn) {
+    void UpdateStatsDelta(StatOp op) {
         talus_npu_stats_t st{};
         talus_npu_get_stats(ctx, &st);
         const double d_wait = std::max(0.0, st.host_wait_us_total - last_wait_us);
@@ -253,12 +274,21 @@ struct PrefillNpu::Impl {
         last_waits = st.waits;
         if (d_cnt == 0) return;
         const double per_wait = d_wait / static_cast<double>(d_cnt);
-        if (is_gdn) {
-            gdn_wait_us_accum += per_wait;
-            gdn_wait_samples += 1;
-        } else {
-            qsa_wait_us_accum += per_wait;
-            qsa_wait_samples += 1;
+        switch (op) {
+            case StatOp::GdnQkv:
+                qkv_wait_us_accum += per_wait;
+                qkv_wait_samples += 1;
+                break;
+            case StatOp::GdnZ:
+                gdn_wait_us_accum += per_wait;
+                gdn_wait_samples += 1;
+                break;
+            case StatOp::QsaQ:
+                qsa_wait_us_accum += per_wait;
+                qsa_wait_samples += 1;
+                break;
+            case StatOp::Shexp:
+                break;
         }
     }
 };
@@ -334,11 +364,15 @@ PrefillNpu* PrefillNpu::GetOrCreate(std::string* err) {
 
     m.min_t = std::max(128, EnvInt("TALUS_NPU_MIN_T", 2048));
     m.max_groups = std::clamp(EnvInt("TALUS_NPU_MAX_GROUPS", static_cast<int>(kMaxGroups)), 1, static_cast<int>(kMaxGroups));
+    m.qkv_slices_cfg = EnvInt("TALUS_NPU_QKV_SLICES", -1);
     m.z_slices_cfg = EnvInt("TALUS_NPU_Z_SLICES", -1);
     m.q_slices_cfg = EnvInt("TALUS_NPU_Q_SLICES", -1);
     m.shexp_on = EnvInt("TALUS_NPU_SHEXP", 1) != 0;
     m.auto_tune = EnvInt("TALUS_NPU_AUTO_TUNE", 1) != 0;
 
+    if (m.qkv_slices_cfg >= 0) {
+        m.qkv_slices = static_cast<uint32_t>(std::clamp(m.qkv_slices_cfg, 0, static_cast<int>(kQkvSlicesMax)));
+    }
     if (m.z_slices_cfg >= 0) {
         m.z_slices = static_cast<uint32_t>(std::clamp(m.z_slices_cfg, 0, static_cast<int>(kZSlicesMax)));
     }
@@ -350,8 +384,9 @@ PrefillNpu* PrefillNpu::GetOrCreate(std::string* err) {
     (void)talus_npu_check_env_safety(safety, sizeof(safety));
     std::fprintf(
         stderr,
-        "talus npu: enabled (4096x2560x1024, min_T=%lld, z_slices=%u%s, q_slices=%u%s, shexp=%s, %s)\n",
+        "talus npu: enabled (4096x2560x1024, min_T=%lld, qkv_slices=%u%s, z_slices=%u%s, q_slices=%u%s, shexp=%s, %s)\n",
         static_cast<long long>(m.min_t),
+        m.qkv_slices, m.qkv_slices_cfg < 0 && m.auto_tune ? " auto" : "",
         m.z_slices, m.z_slices_cfg < 0 && m.auto_tune ? " auto" : "",
         m.q_slices, m.q_slices_cfg < 0 && m.auto_tune ? " auto" : "",
         m.shexp_on ? "on" : "off",
@@ -380,6 +415,8 @@ void PrefillNpu::SetContext(const void* wt_ptr) {
         // Weight pointers may have been reallocated for a new model; entries also check src_ptr.
         impl_->current_wt = wt_ptr;
     }
+    impl_->cached_a_layer = -1;
+    impl_->cached_a_tn = 0;
 }
 
 void* PrefillNpu::RawCtx() const noexcept {
@@ -393,34 +430,37 @@ void PrefillNpu::WaitCallback(void* arg) {
     }
 }
 
-bool PrefillNpu::StartGdnZ(
+bool PrefillNpu::StartGdnQkv(
     void* cs,
     strata::prefill::Gemm* gemm,
     int64_t layer,
-    const WeightDesc& wg,
+    const WeightDesc& wqkv,
     const uint16_t* mixed_h,
     int64_t t_n,
-    int64_t* z_gpu_cols_out
+    int64_t* qkv_gpu_cols_out
 ) {
-    if (!Eligible(t_n) || wg.ne0 != kNpuK || wg.ne1 != kZCols || mixed_h == nullptr) return false;
+    if (qkv_gpu_cols_out) *qkv_gpu_cols_out = kQkvCols;
+    if (!Eligible(t_n) || wqkv.ne0 != kNpuK || wqkv.ne1 != kQkvCols || mixed_h == nullptr) return false;
     const std::lock_guard lock(impl_->mutex);
     Impl& m = *impl_;
     if (m.op_inflight.exchange(false)) {
         (void)talus_npu_wait(m.ctx, cs);
     }
-    if (m.z_slices == 0) return false;
+    m.cached_a_layer = -1;
+    m.cached_a_tn = 0;
+    if (m.qkv_slices == 0) return false;
 
     const int64_t groups = (t_n + kNpuTokens - 1) / kNpuTokens;
     if (!m.EnsureCapacity(groups)) return false;
 
-    const uint32_t slices = m.z_slices;
-    const uint32_t gpu_cols = kZCols - slices * kNpuN;
-    const uint32_t slice0 = kZSlicesMax - slices;
+    const uint32_t slices = m.qkv_slices;
+    const uint32_t gpu_cols = kQkvCols - slices * kNpuN;
+    const uint32_t slice0 = kQkvSlicesMax - slices;
 
     std::vector<int32_t> b_ids(slices);
     for (uint32_t s = 0; s < slices; ++s) {
         const uint32_t row0 = gpu_cols + s * kNpuN;
-        const int32_t bid = m.EnsureWeightSlice(cs, gemm, layer, OpKind::GdnZ, slice0 + s, row0, kNpuN, wg);
+        const int32_t bid = m.EnsureWeightSlice(cs, gemm, layer, OpKind::GdnQkv, slice0 + s, row0, kNpuN, wqkv);
         if (bid < 0) return false;
         b_ids[s] = bid;
     }
@@ -439,7 +479,101 @@ bool PrefillNpu::StartGdnZ(
 
         std::vector<int32_t> c_ids(slices);
         for (uint32_t s = 0; s < slices; ++s) {
-            c_ids[s] = m.c_pool[static_cast<size_t>(g * kQSlicesMax + s)];
+            c_ids[s] = m.c_pool[static_cast<size_t>(g * kPoolSlices + kQkvPoolOffset + s)];
+        }
+        if (talus_npu_submit(m.ctx, stage, a_id, b_ids.data(), c_ids.data(), static_cast<int32_t>(slices)) == 0) {
+            if (g > 0) (void)talus_npu_wait(m.ctx, cs);
+            return false;
+        }
+    }
+
+    m.op_inflight.store(true);
+    m.active_groups = groups;
+    m.active_qkv_gpu_cols = gpu_cols;
+    m.active_qkv_slices = slices;
+    m.cached_a_layer = layer;
+    m.cached_a_tn = t_n;
+    if (qkv_gpu_cols_out) *qkv_gpu_cols_out = static_cast<int64_t>(gpu_cols);
+    return true;
+}
+
+bool PrefillNpu::FinishGdnQkv(void* cs, float* qkv_dev, int64_t t_n) {
+    if (!impl_ || !impl_->ctx || qkv_dev == nullptr) return false;
+    const std::lock_guard lock(impl_->mutex);
+    Impl& m = *impl_;
+    m.op_inflight.store(false);
+    if (talus_npu_wait(m.ctx, cs) == 0) return false;
+    m.UpdateStatsDelta(StatOp::GdnQkv);
+
+    for (int64_t g = 0; g < m.active_groups; ++g) {
+        const uint32_t valid_t = static_cast<uint32_t>(std::min<int64_t>(kNpuTokens, t_n - g * kNpuTokens));
+        float* dst_g = qkv_dev + static_cast<size_t>(g) * kNpuTokens * kQkvCols;
+        for (uint32_t s = 0; s < m.active_qkv_slices; ++s) {
+            const int32_t c_id = m.c_pool[static_cast<size_t>(g * kPoolSlices + kQkvPoolOffset + s)];
+            const uint32_t col0 = m.active_qkv_gpu_cols + s * kNpuN;
+            talus_npu_decode_output(
+                talus_npu_device_ptr(m.ctx, c_id), dst_g, kNpuTokens, valid_t, kNpuN,
+                kQkvCols, col0, 0, kNpuN, cs);
+        }
+    }
+    return true;
+}
+
+bool PrefillNpu::StartGdnZ(
+    void* cs,
+    strata::prefill::Gemm* gemm,
+    int64_t layer,
+    const WeightDesc& wg,
+    const uint16_t* mixed_h,
+    int64_t t_n,
+    int64_t* z_gpu_cols_out
+) {
+    if (!Eligible(t_n) || wg.ne0 != kNpuK || wg.ne1 != kZCols || mixed_h == nullptr) return false;
+    const std::lock_guard lock(impl_->mutex);
+    Impl& m = *impl_;
+    if (m.op_inflight.exchange(false)) {
+        (void)talus_npu_wait(m.ctx, cs);
+    }
+    const bool reuse_a = (m.cached_a_layer == layer && m.cached_a_tn == t_n);
+    m.cached_a_layer = -1;
+    m.cached_a_tn = 0;
+    if (m.z_slices == 0) return false;
+
+    const int64_t groups = (t_n + kNpuTokens - 1) / kNpuTokens;
+    if (!m.EnsureCapacity(groups)) return false;
+
+    const uint32_t slices = m.z_slices;
+    const uint32_t gpu_cols = kZCols - slices * kNpuN;
+    const uint32_t slice0 = kZSlicesMax - slices;
+
+    std::vector<int32_t> b_ids(slices);
+    for (uint32_t s = 0; s < slices; ++s) {
+        const uint32_t row0 = gpu_cols + s * kNpuN;
+        const int32_t bid = m.EnsureWeightSlice(cs, gemm, layer, OpKind::GdnZ, slice0 + s, row0, kNpuN, wg);
+        if (bid < 0) return false;
+        b_ids[s] = bid;
+    }
+
+    void* stage = nullptr;
+    if (!reuse_a) {
+        stage = talus_npu_stage_stream(m.ctx);
+        hipEvent_t ready_ev = m.NextReadyEvent();
+        if (hipEventRecord(ready_ev, static_cast<hipStream_t>(cs)) != hipSuccess) return false;
+        if (hipStreamWaitEvent(static_cast<hipStream_t>(stage), ready_ev, 0) != hipSuccess) return false;
+    }
+
+    for (int64_t g = 0; g < groups; ++g) {
+        const uint32_t valid_t = static_cast<uint32_t>(std::min<int64_t>(kNpuTokens, t_n - g * kNpuTokens));
+        const int32_t a_id = m.a_bufs[static_cast<size_t>(g)];
+        if (!reuse_a) {
+            const uint16_t* x_g = mixed_h + static_cast<size_t>(g) * kNpuTokens * kNpuK;
+            talus_npu_encode_activations_f16(
+                x_g, kNpuK, kNpuTokens, valid_t, kNpuK, 0, kNpuK, talus_npu_device_ptr(m.ctx, a_id), stage);
+        }
+
+        std::vector<int32_t> c_ids(slices);
+        for (uint32_t s = 0; s < slices; ++s) {
+            c_ids[s] = m.c_pool[static_cast<size_t>(g * kPoolSlices + s)];
         }
         if (talus_npu_submit(m.ctx, stage, a_id, b_ids.data(), c_ids.data(), static_cast<int32_t>(slices)) == 0) {
             if (g > 0) (void)talus_npu_wait(m.ctx, cs);
@@ -485,7 +619,7 @@ void PrefillNpu::WaitGdnZ(void* cs) {
     talus_npu_wait(impl_->ctx, cs);
     const std::lock_guard lock(impl_->mutex);
     impl_->op_inflight.store(false);
-    impl_->UpdateStatsDelta(true);
+    impl_->UpdateStatsDelta(StatOp::GdnZ);
 }
 
 bool PrefillNpu::StartQsaQ(
@@ -503,6 +637,8 @@ bool PrefillNpu::StartQsaQ(
     if (m.op_inflight.exchange(false)) {
         (void)talus_npu_wait(m.ctx, cs);
     }
+    m.cached_a_layer = -1;
+    m.cached_a_tn = 0;
     if (m.q_slices == 0) return false;
 
     const int64_t groups = (t_n + kNpuTokens - 1) / kNpuTokens;
@@ -534,7 +670,7 @@ bool PrefillNpu::StartQsaQ(
 
         std::vector<int32_t> c_ids(slices);
         for (uint32_t s = 0; s < slices; ++s) {
-            c_ids[s] = m.c_pool[static_cast<size_t>(g * kQSlicesMax + s)];
+            c_ids[s] = m.c_pool[static_cast<size_t>(g * kPoolSlices + s)];
         }
         if (talus_npu_submit(m.ctx, stage, a_id, b_ids.data(), c_ids.data(), static_cast<int32_t>(slices)) == 0) {
             if (g > 0) (void)talus_npu_wait(m.ctx, cs);
@@ -557,13 +693,13 @@ bool PrefillNpu::FinishQsaQ(void* cs, float* qf_dev, int64_t t_n) {
     Impl& m = *impl_;
     m.op_inflight.store(false);
     if (talus_npu_wait(m.ctx, cs) == 0) return false;
-    m.UpdateStatsDelta(false);
+    m.UpdateStatsDelta(StatOp::QsaQ);
 
     for (int64_t g = 0; g < m.active_groups; ++g) {
         const uint32_t valid_t = static_cast<uint32_t>(std::min<int64_t>(kNpuTokens, t_n - g * kNpuTokens));
         float* dst_g = qf_dev + static_cast<size_t>(g) * kNpuTokens * kQCols;
         for (uint32_t s = 0; s < m.active_q_slices; ++s) {
-            const int32_t c_id = m.c_pool[static_cast<size_t>(g * kQSlicesMax + s)];
+            const int32_t c_id = m.c_pool[static_cast<size_t>(g * kPoolSlices + s)];
             const uint32_t col0 = m.active_q_gpu_cols + s * kNpuN;
             talus_npu_decode_output(
                 talus_npu_device_ptr(m.ctx, c_id), dst_g, kNpuTokens, valid_t, kNpuN,
@@ -591,6 +727,8 @@ bool PrefillNpu::StartMoeShexp(
     if (m.op_inflight.exchange(false)) {
         (void)talus_npu_wait(m.ctx, cs);
     }
+    m.cached_a_layer = -1;
+    m.cached_a_tn = 0;
     const int64_t groups = (t_n + kNpuTokens - 1) / kNpuTokens;
     if (!m.EnsureCapacity(groups)) return false;
 
@@ -612,8 +750,8 @@ bool PrefillNpu::StartMoeShexp(
             x_g, kNpuK, kNpuTokens, valid_t, kNpuK, 0, kNpuK, talus_npu_device_ptr(m.ctx, a_id), stage);
 
         const int32_t c_ids[2] = {
-            m.c_pool[static_cast<size_t>(g * kQSlicesMax + 0)],
-            m.c_pool[static_cast<size_t>(g * kQSlicesMax + 1)],
+            m.c_pool[static_cast<size_t>(g * kPoolSlices + 0)],
+            m.c_pool[static_cast<size_t>(g * kPoolSlices + 1)],
         };
         if (talus_npu_submit(m.ctx, stage, a_id, b_ids, c_ids, 2) == 0) {
             if (g > 0) (void)talus_npu_wait(m.ctx, cs);
@@ -632,12 +770,12 @@ bool PrefillNpu::FinishMoeShexp(void* cs, uint16_t* sh_h_dev, int64_t t_n) {
     Impl& m = *impl_;
     m.op_inflight.store(false);
     if (talus_npu_wait(m.ctx, cs) == 0) return false;
-    m.UpdateStatsDelta(false);
+    m.UpdateStatsDelta(StatOp::Shexp);
 
     for (int64_t g = 0; g < m.active_groups; ++g) {
         const uint32_t valid_t = static_cast<uint32_t>(std::min<int64_t>(kNpuTokens, t_n - g * kNpuTokens));
-        const int32_t cg = m.c_pool[static_cast<size_t>(g * kQSlicesMax + 0)];
-        const int32_t cu = m.c_pool[static_cast<size_t>(g * kQSlicesMax + 1)];
+        const int32_t cg = m.c_pool[static_cast<size_t>(g * kPoolSlices + 0)];
+        const int32_t cu = m.c_pool[static_cast<size_t>(g * kPoolSlices + 1)];
         uint16_t* out_g = sh_h_dev + static_cast<size_t>(g) * kNpuTokens * kShexpCols;
         talus_npu_swiglu(
             talus_npu_device_ptr(m.ctx, cg),
@@ -657,11 +795,23 @@ void PrefillNpu::EndChunk() {
     if (!impl_) return;
     const std::lock_guard lock(impl_->mutex);
     Impl& m = *impl_;
+    m.cached_a_layer = -1;
+    m.cached_a_tn = 0;
     if (m.op_inflight.exchange(false) && m.ctx != nullptr) {
         (void)talus_npu_wait(m.ctx, nullptr);
     }
     if (!m.auto_tune) return;
 
+    if (m.qkv_slices_cfg < 0 && m.qkv_wait_samples >= 4) {
+        const double avg_wait = m.qkv_wait_us_accum / m.qkv_wait_samples;
+        if (avg_wait > 300.0 && m.qkv_slices > 0) {
+            m.qkv_slices -= 1;
+        } else if (avg_wait < 40.0 && m.qkv_slices < kQkvAutoMax) {
+            m.qkv_slices += 1;
+        }
+        m.qkv_wait_us_accum = 0.0;
+        m.qkv_wait_samples = 0;
+    }
     if (m.z_slices_cfg < 0 && m.gdn_wait_samples >= 4) {
         const double avg_wait = m.gdn_wait_us_accum / m.gdn_wait_samples;
         if (avg_wait > 350.0 && m.z_slices > 1) {

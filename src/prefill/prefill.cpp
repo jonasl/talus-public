@@ -2964,14 +2964,36 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfGdn, cs);
                     float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                    int64_t qkv_gpu_cols = wqkv->ne1;
+                    bool npu_qkv = false;
                     int64_t z_gpu_cols = ZV;
                     bool npu_z = false;
 #ifdef STRATA_USE_HIP
                     if (npu != nullptr) {
-                        npu_z = npu->StartGdnZ(m.cs, &m.gemm, l, to_npu_w(wg), m.mixed_h, T, &z_gpu_cols);
+                        npu_qkv = npu->StartGdnQkv(m.cs, &m.gemm, l, to_npu_w(wqkv), m.mixed_h, T, &qkv_gpu_cols);
                     }
 #endif
-                    if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
+                    if (npu_qkv) {
+                        if (qkv_gpu_cols > 0) {
+                            if (!wqkv->native_data) { err = v.name("attn_qkv.weight") + " has no native GGUF blocks"; return false; }
+                            m.gemm.native(m.mixed_h, wqkv->native_type, wqkv->native_data, m.qkv, T, qkv_gpu_cols,
+                                          wqkv->ne0, wqkv->ne1, 0.0f, 0);
+                        }
+                        if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
+                        if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
+                        gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
+#ifdef STRATA_USE_HIP
+                        if (!npu->FinishGdnQkv(m.cs, m.qkv, T)) { err = "prefill: NPU GDN qkv finish failed"; return false; }
+                        npu_z = npu->StartGdnZ(m.cs, &m.gemm, l, to_npu_w(wg), m.mixed_h, T, &z_gpu_cols);
+#endif
+                    } else {
+#ifdef STRATA_USE_HIP
+                        if (npu != nullptr) {
+                            npu_z = npu->StartGdnZ(m.cs, &m.gemm, l, to_npu_w(wg), m.mixed_h, T, &z_gpu_cols);
+                        }
+#endif
+                        if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
+                    }
                     if (npu_z) {
                         if (z_gpu_cols > 0) {
                             if (!wg->native_data) { err = v.name("attn_gate.weight") + " has no native GGUF blocks"; return false; }
@@ -2980,10 +3002,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     } else {
                         if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
                     }
-                    if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
-                    if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
-                    pt.mark(kPfGdnConv, cs);   // "gdn" is the projections in; the rest on their own lines
-                    gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
+                    if (!npu_qkv) {
+                        if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
+                        if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
+                        pt.mark(kPfGdnConv, cs);   // "gdn" is the projections in; the rest on their own lines
+                        gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
+                    } else {
+                        pt.mark(kPfGdnConv, cs);
+                    }
                     gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs);
                     pt.mark(kPfGdnRec, cs);
                     const int64_t ld_y = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;

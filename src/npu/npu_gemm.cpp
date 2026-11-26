@@ -789,8 +789,11 @@ void NpuGemm::FinalizeWeights(int id) {
 bool NpuGemm::Submit(hipStream_t ready_stream, int a_id, const int* b_ids, const int* c_ids, int count) {
     if (count <= 0) return true;
     Trace("submit", a_id, count);
-    hipEvent_t ev = impl_->NextEvent();
-    if (hipEventRecord(ev, ready_stream) != hipSuccess) return false;
+    hipEvent_t ev = nullptr;
+    if (ready_stream != nullptr) {
+        ev = impl_->NextEvent();
+        if (hipEventRecord(ev, ready_stream) != hipSuccess) return false;
+    }
     const std::uint32_t seq = impl_->submit_seq.fetch_add(1, std::memory_order_relaxed) + 1;
     Call call{ev, a_id, {b_ids, b_ids + count}, {c_ids, c_ids + count}, seq};
     {

@@ -393,9 +393,22 @@ bool TestNpuHardware(const std::string& xclbin, const std::string& insts, int it
         }
     }
     (void)hipStreamSynchronize(stream);
+    // Regression test for two-phase GDN qkv->z reuse:
+    // Submit #1 on stage -> Wait -> Submit #2 with ready_stream=nullptr reusing a_id into disjoint c4[2..3].
+    talus_npu_encode_activations_f16(
+        static_cast<const uint16_t*>(d_x), K, T, 64, K, 0, K, talus_npu_device_ptr(ctx, a_id), stage);
+    if (talus_npu_submit(ctx, stage, a_id, b4.data(), c4.data(), 2) == 0 ||
+        talus_npu_wait(ctx, stream) == 0 ||
+        talus_npu_submit(ctx, nullptr, a_id, b4.data() + 2, c4.data() + 2, 2) == 0 ||
+        talus_npu_wait(ctx, stream) == 0 ||
+        hipStreamSynchronize(stream) != hipSuccess) {
+        std::fprintf(stderr, "npu_bench: two-phase a_id reuse submit(nullptr) failed\n");
+        talus_npu_destroy(ctx);
+        return false;
+    }
     (void)hipEventDestroy(ev0);
     (void)hipEventDestroy(ev1);
-    std::printf("[PASS] async interleaved stream/stage submit+wait parity (no AB-BA deadlock)\n");
+    std::printf("[PASS] async interleaved stream/stage & two-phase a_id reuse parity\n");
 
     (void)hipFree(d_x);
     (void)hipFree(d_w);

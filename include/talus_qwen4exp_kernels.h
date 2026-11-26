@@ -1840,6 +1840,9 @@ void tk_qwen4exp_p2_mmq_run(void* mmq_ctx, const void* w, int32_t type, int64_t 
                             int64_t total_rows, int64_t max_rows, float* dst, int64_t ld_dst, void* stream);
 // ---- NPU prefill assist (opt-in via TALUS_NPU_DIR; 0 = inactive/ineligible)
 int tk_qwen4exp_p2_npu_init(void* wt, char* err, size_t err_cap);
+int tk_qwen4exp_p2_npu_gdn_qkv_start(void* cs, void* gemm, int64_t layer, const tk_qwen4exp_p2_weight_t* wqkv,
+                                     const uint16_t* mixed_h, int64_t t_n, int64_t* qkv_gpu_cols_out);
+int tk_qwen4exp_p2_npu_gdn_qkv_finish(void* cs, float* qkv_dev, int64_t t_n);
 int tk_qwen4exp_p2_npu_gdn_start(void* cs, void* gemm, int64_t layer, const tk_qwen4exp_p2_weight_t* wg,
                                  const uint16_t* mixed_h, int64_t t_n, int64_t* z_gpu_cols_out);
 void tk_qwen4exp_p2_npu_gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,

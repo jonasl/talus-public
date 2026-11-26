@@ -30,7 +30,21 @@ public:
     bool Eligible(int64_t t_n) const noexcept;
     void SetContext(const void* wt_ptr);
 
+    // GDN: offloads trailing columns of `attn_qkv.weight` (`qkv`: [t_n, 10240]).
+    // On success returns true, sets `qkv_gpu_cols_out` (columns GPU must compute into `qkv`).
+    bool StartGdnQkv(
+        void* cs,
+        strata::prefill::Gemm* gemm,
+        int64_t layer,
+        const WeightDesc& wqkv,
+        const uint16_t* mixed_h,
+        int64_t t_n,
+        int64_t* qkv_gpu_cols_out
+    );
+    bool FinishGdnQkv(void* cs, float* qkv_dev, int64_t t_n);
+
     // GDN: offloads trailing columns of `attn_gate.weight` (`z`: [t_n, 6144]).
+    // Reuses already-encoded activation buffers from `StartGdnQkv` when called for the same layer/t_n.
     // On success returns true, sets `z_gpu_cols_out` (columns GPU must compute into `z`).
     bool StartGdnZ(
         void* cs,

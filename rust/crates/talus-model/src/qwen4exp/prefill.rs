@@ -970,6 +970,16 @@ fn pic_ffi() -> Option<&'static PicFfi> {
 #[derive(Clone, Copy)]
 struct NpuFfi {
     init: unsafe extern "C" fn(*mut c_void, *mut c_char, usize) -> c_int,
+    gdn_qkv_start: unsafe extern "C" fn(
+        *mut c_void,
+        *mut c_void,
+        i64,
+        *const TkP2Weight,
+        *const u16,
+        i64,
+        *mut i64,
+    ) -> c_int,
+    gdn_qkv_finish: unsafe extern "C" fn(*mut c_void, *mut f32, i64) -> c_int,
     gdn_start: unsafe extern "C" fn(
         *mut c_void,
         *mut c_void,
@@ -1023,6 +1033,8 @@ fn npu_ffi() -> Option<&'static NpuFfi> {
         let n = std::ptr::null_mut();
         Some(NpuFfi {
             init: l(n, "tk_qwen4exp_p2_npu_init").ok()?,
+            gdn_qkv_start: l(n, "tk_qwen4exp_p2_npu_gdn_qkv_start").ok()?,
+            gdn_qkv_finish: l(n, "tk_qwen4exp_p2_npu_gdn_qkv_finish").ok()?,
             gdn_start: l(n, "tk_qwen4exp_p2_npu_gdn_start").ok()?,
             gdn_recurrence: l(n, "tk_qwen4exp_p2_npu_gdn_recurrence").ok()?,
             qsa_start: l(n, "tk_qwen4exp_p2_npu_qsa_start").ok()?,
@@ -2069,25 +2081,99 @@ unsafe fn run_chunks(
                         .gdn_state
                         .add(((gdn_index - m.gdn_ord0) * m.gdn_floats) as usize);
                     let conv = state.add(m.gdn_state_floats as usize);
-                    let mut z_gpu_cols = zv;
-                    let npu_z = npu.and_then(|n| {
+                    let mut qkv_gpu_cols = wqkv.ne1;
+                    let npu_qkv = npu.and_then(|n| {
                         let mut gc = 0i64;
-                        ((n.gdn_start)(cs, m.gemm, l, &wg, m.mixed_h, t_n, &mut gc) != 0).then(
-                            || {
-                                z_gpu_cols = gc;
+                        ((n.gdn_qkv_start)(cs, m.gemm, l, &wqkv, m.mixed_h, t_n, &mut gc) != 0)
+                            .then(|| {
+                                qkv_gpu_cols = gc;
                                 n
-                            },
-                        )
+                            })
                     });
-                    c.native_proj(
-                        &wqkv,
-                        m.mixed_h,
-                        m.qkv,
-                        t_n,
-                        || wname(l, "attn_qkv.weight"),
-                        0,
-                        0,
-                    )?;
+                    let mut z_gpu_cols = zv;
+                    let npu_z: Option<&'static NpuFfi> =
+                        if let Some(n_qkv) = npu_qkv {
+                            if qkv_gpu_cols > 0 {
+                                if wqkv.native_data.is_null() {
+                                    return Err(format!(
+                                        "prefill: {} has no native GGUF blocks",
+                                        wname(l, "attn_qkv.weight")
+                                    ));
+                                }
+                                (f.gemm_native)(
+                                    m.gemm,
+                                    m.mixed_h,
+                                    wqkv.native_type,
+                                    wqkv.native_data,
+                                    m.qkv,
+                                    t_n,
+                                    qkv_gpu_cols,
+                                    wqkv.ne0,
+                                    wqkv.ne1,
+                                    0.0,
+                                    0,
+                                );
+                            }
+                            c.bf16_proj(
+                                &wa,
+                                m.mixed_bf,
+                                m.ab,
+                                t_n,
+                                || wname(l, "ssm_alpha.weight"),
+                                2 * hv,
+                                m.mixed_bf_lo,
+                                0,
+                            )?;
+                            c.bf16_proj(
+                                &wb,
+                                m.mixed_bf,
+                                m.ab.add(hv as usize),
+                                t_n,
+                                || wname(l, "ssm_beta.weight"),
+                                2 * hv,
+                                m.mixed_bf_lo,
+                                0,
+                            )?;
+                            (f.gdn_gates)(
+                                m.ab,
+                                wdt.data.cast(),
+                                wsa.data.cast(),
+                                m.gate,
+                                m.beta,
+                                t_n,
+                                cs,
+                            );
+                            if (n_qkv.gdn_qkv_finish)(cs, m.qkv, t_n) == 0 {
+                                return Err("prefill: NPU GDN qkv finish failed".into());
+                            }
+                            npu.and_then(|n| {
+                                let mut gc = 0i64;
+                                ((n.gdn_start)(cs, m.gemm, l, &wg, m.mixed_h, t_n, &mut gc) != 0)
+                                    .then(|| {
+                                        z_gpu_cols = gc;
+                                        n
+                                    })
+                            })
+                        } else {
+                            let res = npu.and_then(|n| {
+                                let mut gc = 0i64;
+                                ((n.gdn_start)(cs, m.gemm, l, &wg, m.mixed_h, t_n, &mut gc) != 0)
+                                    .then(|| {
+                                        z_gpu_cols = gc;
+                                        n
+                                    })
+                            });
+                            c.native_proj(
+                                &wqkv,
+                                m.mixed_h,
+                                m.qkv,
+                                t_n,
+                                || wname(l, "attn_qkv.weight"),
+                                0,
+                                0,
+                            )?;
+                            res
+                        };
                     if npu_z.is_some() {
                         if z_gpu_cols > 0 {
                             if wg.native_data.is_null() {
@@ -2121,36 +2207,40 @@ unsafe fn run_chunks(
                             0,
                         )?;
                     }
-                    c.bf16_proj(
-                        &wa,
-                        m.mixed_bf,
-                        m.ab,
-                        t_n,
-                        || wname(l, "ssm_alpha.weight"),
-                        2 * hv,
-                        m.mixed_bf_lo,
-                        0,
-                    )?;
-                    c.bf16_proj(
-                        &wb,
-                        m.mixed_bf,
-                        m.ab.add(hv as usize),
-                        t_n,
-                        || wname(l, "ssm_beta.weight"),
-                        2 * hv,
-                        m.mixed_bf_lo,
-                        0,
-                    )?;
-                    c.pt.mark(PF_GDN_CONV, cs);
-                    (f.gdn_gates)(
-                        m.ab,
-                        wdt.data.cast(),
-                        wsa.data.cast(),
-                        m.gate,
-                        m.beta,
-                        t_n,
-                        cs,
-                    );
+                    if npu_qkv.is_none() {
+                        c.bf16_proj(
+                            &wa,
+                            m.mixed_bf,
+                            m.ab,
+                            t_n,
+                            || wname(l, "ssm_alpha.weight"),
+                            2 * hv,
+                            m.mixed_bf_lo,
+                            0,
+                        )?;
+                        c.bf16_proj(
+                            &wb,
+                            m.mixed_bf,
+                            m.ab.add(hv as usize),
+                            t_n,
+                            || wname(l, "ssm_beta.weight"),
+                            2 * hv,
+                            m.mixed_bf_lo,
+                            0,
+                        )?;
+                        c.pt.mark(PF_GDN_CONV, cs);
+                        (f.gdn_gates)(
+                            m.ab,
+                            wdt.data.cast(),
+                            wsa.data.cast(),
+                            m.gate,
+                            m.beta,
+                            t_n,
+                            cs,
+                        );
+                    } else {
+                        c.pt.mark(PF_GDN_CONV, cs);
+                    }
                     (f.gdn_conv)(conv, m.qkv, wc.data.cast(), m.hbuf, t_n, eps, cs);
                     c.pt.mark(PF_GDN_REC, cs);
                     let ld_y = if e.pf_pad && t_n >= e.pf_switch_min_t.max(64) {

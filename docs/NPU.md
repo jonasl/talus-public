@@ -15,7 +15,7 @@ All NPU paths are **opt-in** (gated by `TALUS_NPU_DIR` or `TALUS_NPU_XCLBIN`/`TA
 |---|---|---|
 | Core XRT `dlopen` runtime & zero-copy BOs (`src/npu/npu_gemm.*`) | Implemented | `libxrt_coreutil.so.2` pimpl ABI; `hipHostMallocMapped` + `1u << 25` (`AMDXDNA_BO_SHARE`) |
 | HIP `v8bfp16ebs8` staging & SwiGLU kernels (`src/npu/npu_stage.cu`) | Implemented | Positive saturation bump fix, `Q8_0`/`F16`/`BF16`, packed pair, `valid_tokens` padding |
-| `qwen4exp` (Flash-Next) hybrid prefill (`src/npu/prefill_npu.*`) | Implemented | Rust (`prefill.rs`) and C++ (`prefill.cpp`) prompt paths; GDN `z`, QSA `q`, MoE `shexp`; compatible with `--vision` and `--batch` slots |
+| `qwen4exp` (Flash-Next) hybrid prefill (`src/npu/prefill_npu.*`) | Implemented | Rust (`prefill.rs`) and C++ (`prefill.cpp`) prompt paths; GDN `qkv` + `z`, QSA `q`, MoE `shexp`; compatible with `--vision` and `--batch` slots |
 | Rust kernel bindings (`rust/crates/talus-kernels/src/npu.rs`) | Implemented | Safe `NpuContext` / `NpuFns` wrapper and unit tests |
 | Parity & throughput harness (`tests/hip/npu_bench.cpp`) | Implemented | Built as `talus-npu-bench` |
 | DFlash2 / MTP & batched `slot_mtp` decode offload | Proposed | Requires small-M (`64`/`128`/`256`) `mlir-aie` kernels |
@@ -75,10 +75,11 @@ TALUS_NPU_DIR=./tools/npu ./build/talus-cli ...
 | `TALUS_NPU_INSTS` | `<dir>/insts_4096x2560x1024_128x64x128.txt` | Explicit path to instruction stream file |
 | `TALUS_NPU_MIN_T` | `2048` | Minimum chunk token count `t_n` eligible for NPU offload |
 | `TALUS_NPU_MAX_GROUPS` | `4` | Maximum `4096`-token groups per chunk (`1..4`, up to `16384` tokens) |
+| `TALUS_NPU_QKV_SLICES` | `-1` (auto, starts at `2`) | Fixed number of `1024`-col slices (`0..10`, auto-tunes `0..6`) offloaded for GDN `attn_qkv` |
 | `TALUS_NPU_Z_SLICES` | `-1` (auto, starts at `2`) | Fixed number of `1024`-col slices (`0..6`) offloaded for GDN `attn_gate` (`z`) |
 | `TALUS_NPU_Q_SLICES` | `-1` (auto, starts at `4`) | Fixed number of `1024`-col slices (`0..12`) offloaded for QSA `attn_q` |
 | `TALUS_NPU_SHEXP` | `1` | `1` = offload MoE `ffn_gate_shexp` + `ffn_up_shexp` with fused SwiGLU, `0` = GPU |
-| `TALUS_NPU_AUTO_TUNE` | `1` | Dynamically adjusts `z_slices` and `q_slices` based on `host_wait_us_total` |
+| `TALUS_NPU_AUTO_TUNE` | `1` | Dynamically adjusts `qkv_slices`, `z_slices`, and `q_slices` based on per-op `host_wait_us_total` |
 | `TALUS_NPU_ISOLATE` | `0` | `0` = zero-copy `hipHostMallocMapped` shared BO, `1` = private XRT BO + `CopyPool` |
 | `TALUS_NPU_KEEPALIVE` | `1` | Background 1s heartbeat to prevent `D3hot` wakeups between chunks (`0` = off) |
 | `TALUS_NPU_HW_WAIT` | `0` | `1` = use `hipStreamWaitValue32` on mapped completion counter when supported |
@@ -108,10 +109,11 @@ TALUS_NPU_DIR=./tools/npu ./build/talus-cli ...
 
 ### 3. `qwen4exp` (Flash-Next) Prompt Integration (`src/npu/prefill_npu.{hpp,cpp}`, `src/program/qwen4exp_p2.cpp`, `rust/crates/talus-model/src/qwen4exp/prefill.rs`, `src/prefill/prefill.cpp`)
 
-Both the Rust (`TALUS_FN_RUST=1`) and C++ (`TALUS_FN_RUST=0`) prompt paths integrate `PrefillNpu` at the same three model seams (`n_embd = 2560`):
+Both the Rust (`TALUS_FN_RUST=1`) and C++ (`TALUS_FN_RUST=0`) prompt paths integrate `PrefillNpu` at the same model seams (`n_embd = 2560`):
 
-1. **GDN layers (36 of 48 layers) — `attn_gate.weight` (`z`, width `6144`)**:
-   - Trailing `z_slices` (`1024` cols each) of `z` are submitted to NPU while GPU computes `attn_qkv`, any remaining `z_gpu_cols` columns of `z`, `ssm_alpha`, `ssm_beta`, `gdn_gates`, `gdn_conv`, and the GDN recurrence kernel.
+1. **GDN layers (36 of 48 layers) — `attn_qkv.weight` (width `10240`) + `attn_gate.weight` (`z`, width `6144`)**:
+   - **Phase 1 (`StartGdnQkv` / `FinishGdnQkv`)**: Trailing `qkv_slices` (`1024` cols each) of `attn_qkv` are submitted to NPU (`C` pool slots `6..15`) while GPU computes the remaining `qkv_gpu_cols` columns of `attn_qkv`, `ssm_alpha`, `ssm_beta`, and `gdn_gates`. Before `gdn_conv`, `FinishGdnQkv` waits for NPU and decodes the trailing `qkv` columns into `m.qkv`.
+   - **Phase 2 (`StartGdnZ` / `gdn_recurrence_npu`)**: Trailing `z_slices` (`1024` cols each) of `attn_gate` are submitted to NPU (`C` pool slots `0..5`, disjoint from `qkv` slots) — reusing the already-encoded `a_bufs` activations from `StartGdnQkv` without re-encoding `m.mixed_h` — while GPU computes any remaining `z_gpu_cols` columns of `z`, `gdn_conv`, and the GDN recurrence kernel. (When `qkv_slices == 0`, `StartGdnZ` starts before full GPU `attn_qkv`.)
    - `gdn_recurrence_npu` (`src/prefill/kernels.cu`, `include/strata/prefill/kernels.hpp`) runs the recurrence first, waits for NPU via `before_epilogue`, and executes `gdn_out_norm_npu_kernel`, which reads NPU `z` columns directly from `z_streams` (`v8bfp16ebs8` C tiles) without decoding `z` into FP32 DRAM.
 2. **QSA layers (12 of 48 layers) — `attn_q.weight` (`qf`, width `12288`)**:
    - Trailing `q_slices` (`1024` cols each) of `attn_q` are submitted to NPU while GPU computes `attn_k`, `attn_v`, GPU `attn_q` columns, indexer projections, RoPE, KV staging/append, and top-K block selection.

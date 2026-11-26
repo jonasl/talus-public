@@ -3179,6 +3179,9 @@ unsafe fn run_chunks(
             if (f.stream_sync)(cs) == 0 {
                 return Err(format!("prefill: {}", c.cuda_err()));
             }
+            if let Some(n) = npu {
+                (n.end_chunk)();
+            }
             let toc2 = Instant::now();
             let mut eb = [0 as c_char; 1024];
             if (f.on_chunk)(pf, m.r, t_n, p0, eb.as_mut_ptr(), eb.len()) == 0 {
@@ -3186,14 +3189,13 @@ unsafe fn run_chunks(
             }
             host_sync_ms += (toc2 - toc).as_secs_f64() * 1000.0;
             host_chunk_ms += ms_since(toc2);
+        } else if let Some(n) = npu {
+            (n.end_chunk)();
         }
         // the chunk's stager jobs are done (prefill.cpp's StagerDone at the end of the iteration)
         if pending.stager_chunk {
             (f.stager_finish)(pf);
             pending.stager_chunk = false;
-        }
-        if let Some(n) = npu {
-            (n.end_chunk)();
         }
         c0 += m.t;
     }

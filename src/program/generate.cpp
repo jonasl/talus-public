@@ -9015,6 +9015,7 @@ static int qwen4exp_engine_main(int argc, char** argv) {
         // runs there, on the Prefill that ran the chunk, instead of the drafter's own per-8-row pass.  The drafts' K/V
         // come from Q8_1 x Q8_0 MMQ rather than mmvq: drafts may differ, the target's tokens never.
         static const bool split_mtp_batch = strata::program::draft_kv::split_env_on(std::getenv("STRATA_SPLIT_MTP_BATCH"));
+        std::function<bool(int64_t done, std::string& e)> batch_chunk_hook;
         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
             std::vector<int32_t> nxt((size_t) T);
             for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
@@ -9078,6 +9079,7 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                 if (periodic_checkpoint) pp_next_check = done + o.prompt_cache_every;
                 if (tail_checkpoint) pp_tail_saved = true;
             }
+            if (batch_chunk_hook && !batch_chunk_hook(done, e)) return false;
             return true;
         };
         if (multi_gpu) {   // the batched prompt is reported by its last stage (the drafter's rows are there)
@@ -10448,32 +10450,23 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                 strata::core::SessionState& to = *bslot_ss[k][(size_t) b];
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
-                strata::core::ConversationCheckpoint ck;
-                ck.ids = ids;
-                if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
-                    !strata::core::conversation_checkpoint_restore(ck, to, g, e))
-                    return false;
+                if (!strata::core::conversation_session_copy(from, to, g, ids, e)) return false;
                 for (int64_t j = 0; j < from.qsa_alloc; ++j) {
-                    strata::core::ConversationKv img;
-                    if (!strata::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, e))
-                        return false;
-                    if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
-                    if (!strata::core::conversation_kv_restore(img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
+                    if (!strata::core::conversation_kv_copy(from.qsa_states[from.qsa_ord0 + j],
+                                                            to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
                         return false;
                 }
-                if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
+                if (!strata::core::conversation_copy_sync(e)) return false;
             }
             if (batch_mtp) {
                 // Admission first builds the solo draft KV; copy it into the slot before drafting.  Both drafters' K/V
                 // are on the drafter's device (the last stage's GPU with a layer split): the copy's ring refill is a
                 // kernel launch there.
                 const strata::core::OnDevice on_mtp(mtp.device());
-                strata::core::ConversationKv image;
                 if (!mtp.idle(e) || !slot_mtp[(size_t) b]->idle(e) ||
-                    !strata::core::conversation_kv_save(image, mtp.kv_state(), draft_geometry, upto, false, e) ||
-                    !strata::core::conversation_kv_restore(image, slot_mtp[(size_t) b]->kv_state(),
-                                                           draft_geometry, upto, false, e) ||
-                    cudaDeviceSynchronize() != cudaSuccess)
+                    !strata::core::conversation_kv_copy(mtp.kv_state(), slot_mtp[(size_t) b]->kv_state(),
+                                                        draft_geometry, upto, false, e) ||
+                    !strata::core::conversation_copy_sync(e))
                     return false;
                 slot_mtp[(size_t) b]->set_prompt_len(upto);
             }
@@ -10494,31 +10487,22 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                     if (!strata::core::conversation_checkpoint_restore(k == 0 ? *at : at->stage_parts[k - 1], to, g, e))
                         return false;
                 } else {
-                    strata::core::ConversationCheckpoint ck;
-                    ck.ids = bs[(size_t) b].ids;
-                    if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
-                        !strata::core::conversation_checkpoint_restore(ck, to, g, e))
-                        return false;
+                    if (!strata::core::conversation_session_copy(from, to, g, bs[(size_t) b].ids, e)) return false;
                 }
                 for (int64_t j = 0; j < from.qsa_alloc; ++j) {
-                    strata::core::ConversationKv img;
-                    if (!strata::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, e))
-                        return false;
-                    if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
-                    if (!strata::core::conversation_kv_restore(img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
+                    if (!strata::core::conversation_kv_copy(from.qsa_states[from.qsa_ord0 + j],
+                                                            to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
                         return false;
                 }
-                if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
+                if (!strata::core::conversation_copy_sync(e)) return false;
             }
             if (batch_mtp) {
                 // A returning solo request resumes from its slot's draft KV (on the drafter's device, as above).
                 const strata::core::OnDevice on_mtp(mtp.device());
-                strata::core::ConversationKv image;
                 if (!slot_mtp[(size_t) b]->idle(e) || !mtp.idle(e) ||
-                    !strata::core::conversation_kv_save(image, slot_mtp[(size_t) b]->kv_state(),
+                    !strata::core::conversation_kv_copy(slot_mtp[(size_t) b]->kv_state(), mtp.kv_state(),
                                                         draft_geometry, upto, false, e) ||
-                    !strata::core::conversation_kv_restore(image, mtp.kv_state(), draft_geometry, upto, false, e) ||
-                    cudaDeviceSynchronize() != cudaSuccess)
+                    !strata::core::conversation_copy_sync(e))
                     return false;
                 mtp.set_prompt_len(upto);
             }
@@ -13849,22 +13833,13 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                 const int64_t C = std::max<int64_t>(sp.chunk(), 1);
                 const int64_t piece = strata::program::batch_read_piece(o.batch > 0, piped, !stages.empty(), batch_on(), C, yield_chunks);
                 if (piece <= 0) return sp.run(ids.data() + a0, b0 - a0, a0, e);
-                for (int64_t q = a0; q < b0;) {
-                    const int64_t r = std::min(b0, q + piece);
-                    const auto tq = Clock::now();
-                    if (!sp.run(ids.data() + q, r - q, q, e)) return false;
-                    // a step far slower than the norm means the engine is starving over the
-                    // read (an expert- or page-cache storm re-reads under it; two engines on
-                    // one shared-RAM GPU does both): the read holds the control lines, so
-                    // every other request queues behind it and the engine looks frozen.
-                    // STRATA_STEP_GAP_MS moves the bar (0 prints every step) while chasing one.
+                auto at_boundary = [&](int64_t q, int64_t prev_q, Clock::time_point tq, std::string& be) -> bool {
                     const double gap_s =
                         std::chrono::duration<double, std::milli>(Clock::now() - tq).count() / 1000.0;
                     if (gap_s * 1000.0 > step_gap_warn_ms)
                         std::fprintf(stderr, "talus batch: read step %lld..%lld took %.1f s\n",
-                                     (long long) q, (long long) r, gap_s);
-                    q = r;
-                    if (q >= b0) continue;
+                                     (long long) prev_q, (long long) q, gap_s);
+                    if (q >= b0) return true;
                     int ys = -1;
                     {   // a BSTOP that came meanwhile ends its slot at its next window; a BYIELD is for this read
                         std::lock_guard<std::mutex> lk(in_mu);
@@ -13918,19 +13893,19 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                             std::fprintf(stderr, "talus batch: the prompt read gives way at %lld of %lld tokens; slot %d "
                                                  "holds it (copied in %.1f ms)\n", (long long) q, (long long) n, ys,
                                          std::chrono::duration<double, std::milli>(Clock::now() - ty).count());
-                            e = "yield";
+                            be = "yield";
                             return false;
                         }
                         if (can) bs[(size_t) ys].cached = false;   // half written
                         std::fprintf(stderr, "talus batch: BYIELD %d not taken at %lld of %lld%s%s\n", ys, (long long) q,
                                      (long long) n, ye.empty() ? "" : ": ", ye.c_str());
                     }
-                    if (decode_share <= 0.0 || !batch_on()) continue;
+                    if (decode_share <= 0.0 || !batch_on()) return true;
                     const double budget = decode_share * std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
                     const auto td = Clock::now();
                     in_prompt_read = true;
                     do {
-                        if (!batch_step()) { in_prompt_read = false; batch_fatal = true; e = "a batch window failed"; return false; }
+                        if (!batch_step()) { in_prompt_read = false; batch_fatal = true; be = "a batch window failed"; return false; }
                     } while (batch_on() && std::chrono::duration<double, std::milli>(Clock::now() - td).count() < budget);
                     in_prompt_read = false;
                     ++il_parts;
@@ -13940,6 +13915,32 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                                      (long long) q, std::chrono::duration<double, std::milli>(Clock::now() - td).count());
                         std::fflush(stderr);
                     }
+                    return true;
+                };
+                if (stages.empty()) {
+                    // Single-GPU --batch: run [a0, b0) as one continuous sp.run so ple_next SSD lookahead stays
+                    // active across chunks, while still checking BYIELD and running batch_step() at every chunk boundary.
+                    Clock::time_point chunk_t0 = Clock::now();
+                    int64_t prev_q = a0;
+                    struct HookGuard {
+                        std::function<bool(int64_t, std::string&)>& hook;
+                        ~HookGuard() { hook = nullptr; }
+                    } hook_guard{batch_chunk_hook};
+                    batch_chunk_hook = [&](int64_t done, std::string& be) -> bool {
+                        const bool ok = at_boundary(done, prev_q, chunk_t0, be);
+                        prev_q = done;
+                        chunk_t0 = Clock::now();
+                        return ok;
+                    };
+                    return sp.run(ids.data() + a0, b0 - a0, a0, e);
+                }
+                for (int64_t q = a0; q < b0;) {
+                    const int64_t r = std::min(b0, q + piece);
+                    const auto tq = Clock::now();
+                    if (!sp.run(ids.data() + q, r - q, q, e)) return false;
+                    const int64_t prev_q = q;
+                    q = r;
+                    if (!at_boundary(q, prev_q, tq, e)) return false;
                 }
                 return true;
             };

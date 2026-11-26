@@ -226,6 +226,63 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
     return false;
 }
 
+bool conversation_kv_copy(const QsaState& src, const QsaState& dst, const ModelGeometry& g,
+                          int64_t upto, bool index, std::string& error) {
+    Layout ls{}, ld{};
+    if (!layout(src, g, upto, index, ls, error) || !valid(src, ls, upto, error)) return false;
+    if (!layout(dst, g, upto, index, ld, error) || !valid(dst, ld, upto, error)) return false;
+    if (ls.format != ld.format || ls.cells != ld.cells || ls.data != ld.data ||
+        ls.value_data != ld.value_data || ls.scales != ld.scales ||
+        ls.value_scales != ld.value_scales || ls.pooled != ld.pooled) {
+        error = "conversation snapshot: incompatible K/V geometry";
+        return false;
+    }
+    cudaError_t ce = cudaSuccess;
+    cudaStream_t stream = conversation_detail::copy_stream(&ce);
+    if (!stream) {
+        error = std::string("conversation snapshot copy stream: ") + cudaGetErrorString(ce);
+        return false;
+    }
+    const auto sp = pools(src);
+    const auto dp = pools(dst);
+    const std::array<size_t, 5> sizes = {ls.data, ls.value_data, ls.scales, ls.value_scales, ls.pooled};
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        if (!sizes[i]) continue;
+        if (!sp[i] || !dp[i]) { error = "conversation snapshot: missing state buffer"; return false; }
+        ce = cudaMemcpyAsync(dp[i], sp[i], sizes[i], cudaMemcpyDefault, stream);
+        if (ce != cudaSuccess) {
+            error = std::string("conversation snapshot copy: ") + cudaGetErrorString(ce);
+            return false;
+        }
+    }
+    if (dst.kv_mode == 1) strata::kernels::kv_stream_reset(dst.map, stream);
+    if (dst.kv_mode == 2 && upto > 0) {
+        auto shapes = strata::kernels::qsa_real_shapes();
+        shapes.n_head_kv = g.n_head_kv; shapes.head_dim = g.head_dim;
+        const int64_t end = (upto + shapes.page_size - 1) / shapes.page_size;
+        strata::kernels::kv_ring_restore(qsa_attn_pools(dst), dst.host, qsa_kv_format(dst),
+                                         std::max<int64_t>(0, end - dst.n_slots), end, dst.n_slots, shapes, stream);
+    }
+    ce = cudaGetLastError();
+    if (ce == cudaSuccess) return true;
+    error = std::string("conversation snapshot residency copy: ") + cudaGetErrorString(ce);
+    return false;
+}
+
+bool conversation_copy_sync(std::string& error) {
+    cudaError_t ce = cudaSuccess;
+    cudaStream_t stream = conversation_detail::copy_stream(&ce);
+    if (!stream) {
+        error = std::string("conversation snapshot copy stream: ") + cudaGetErrorString(ce);
+        return false;
+    }
+    ce = cudaStreamSynchronize(stream);
+    core::progress_beat();
+    if (ce == cudaSuccess) return true;
+    error = std::string("conversation snapshot sync: ") + cudaGetErrorString(ce);
+    return false;
+}
+
 bool conversation_kv_part_sizes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
                                 std::array<uint64_t, 5>& sizes, std::string& error) {
     Layout l{};

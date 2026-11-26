@@ -25,6 +25,11 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& state
                               int64_t upto, bool include_index, std::string& error);
 bool conversation_kv_restore(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                              int64_t upto, bool include_index, std::string& error);
+// Direct async device/host copy between two QsaState objects on the private copy stream (no host staging).
+// Caller synchronizes the device before copying, and calls conversation_copy_sync() after all layers are queued.
+bool conversation_kv_copy(const QsaState& src, const QsaState& dst, const ModelGeometry& g,
+                          int64_t upto, bool include_index, std::string& error);
+bool conversation_copy_sync(std::string& error);
 // Diagnostic read-back after a synchronized restore. Uses 64 KiB of stack
 // workspace, compares authoritative bytes and resident draft-ring pages, and
 // fingerprints the authoritative payload only. Never changes model state.
@@ -60,6 +65,9 @@ bool conversation_checkpoint_save(ConversationCheckpoint& checkpoint, const Sess
                                   const ModelGeometry& g, std::string& error);
 bool conversation_checkpoint_restore(const ConversationCheckpoint& checkpoint, SessionState& session,
                                      const ModelGeometry& g, std::string& error);
+// Direct async running-state copy between two SessionState objects on the private copy stream (no host staging).
+bool conversation_session_copy(const SessionState& src, SessionState& dst, const ModelGeometry& g,
+                               const std::vector<int32_t>& ids, std::string& error);
 
 struct ConversationView {
     const std::vector<int32_t>& ids;

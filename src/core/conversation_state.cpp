@@ -215,6 +215,52 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
     return sync(error);
 }
 
+bool conversation_session_copy(const SessionState& src, SessionState& dst, const ModelGeometry& g,
+                               const std::vector<int32_t>& ids, std::string& error) {
+#if defined(STRATA_GPU_METAL)
+    ConversationCheckpoint ck;
+    ck.ids = ids;
+    return conversation_checkpoint_save(ck, src, g, error) &&
+           conversation_checkpoint_restore(ck, dst, g, error);
+#endif
+    ConversationStateSizes zs, zd;
+    if (!checkpoint_targets(src, g, ids.size(), zs, error) ||
+        !checkpoint_targets(dst, g, ids.size(), zd, error)) return false;
+    if (src.gdn_alloc != dst.gdn_alloc || src.qsa_ord0 != dst.qsa_ord0 || src.qsa_alloc != dst.qsa_alloc ||
+        (src.ple_hist == nullptr) != (dst.ple_hist == nullptr)) {
+        return fail(error, "incompatible session state carve");
+    }
+    cudaError_t ce = cudaSuccess;
+    cudaStream_t stream = conversation_detail::copy_stream(&ce);
+    if (!stream) {
+        error = std::string("conversation snapshot copy stream: ") + cudaGetErrorString(ce);
+        return false;
+    }
+    auto async_copy = [&](void* d, const void* s, size_t n) -> bool {
+        if (!n) return true;
+        if (!d || !s) return fail(error, "missing running-state buffer");
+        const cudaError_t e = cudaMemcpyAsync(d, s, n, cudaMemcpyDefault, stream);
+        if (e == cudaSuccess) return true;
+        error = std::string("conversation snapshot running-state copy: ") + cudaGetErrorString(e);
+        return false;
+    };
+    if (!async_copy(dst.gdn_state, src.gdn_state, zs.gdn) ||
+        !async_copy(dst.ple_hist, src.ple_hist, src.ple_hist ? zs.ple : 0)) return false;
+    const size_t row = ids.empty() ? 0 : ids.size() / strata::kernels::qsa_real_shapes().idx_block;
+    for (size_t j = 0; j < owned_qsa(src); ++j) {
+        const auto& fs = owned(src, j);
+        const auto& ts = owned(dst, j);
+        if (!async_copy(ts.idx_tail, fs.idx_tail, zs.tail) ||
+            !async_copy(ts.idx_dead, fs.idx_dead, zs.dead) ||
+            !async_copy(ts.idx_block_pos, fs.idx_block_pos, zs.block_pos)) return false;
+        if (!ids.empty() && !async_copy(ts.idx_pooled + row * g.idx_key_dim, fs.idx_dead, zs.dead)) return false;
+    }
+    const size_t tokens = ids.size();
+    dst.ple_prev[0] = tokens >= 2 ? ids[tokens - 2] : -1;
+    dst.ple_prev[1] = tokens >= 1 ? ids[tokens - 1] : -1;
+    return true;
+}
+
 bool conversation_snapshot_bytes(const ConversationView& view, const SessionState& ss,
                                  const ModelGeometry& g, const QsaState* draft, size_t& bytes, std::string& error) {
     bytes = 0;

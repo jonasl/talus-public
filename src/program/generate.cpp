@@ -13842,6 +13842,10 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                     const char* v = std::getenv("STRATA_BATCH_YIELD_CHUNKS");
                     return v != nullptr ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 8;
                 }();
+                static const double step_gap_warn_ms = [] {
+                    const char* v = std::getenv("STRATA_STEP_GAP_MS");
+                    return v != nullptr ? std::max(0.0, std::atof(v)) : 20000.0;
+                }();
                 const int64_t C = std::max<int64_t>(sp.chunk(), 1);
                 const int64_t piece = strata::program::batch_read_piece(o.batch > 0, piped, !stages.empty(), batch_on(), C, yield_chunks);
                 if (piece <= 0) return sp.run(ids.data() + a0, b0 - a0, a0, e);
@@ -13849,6 +13853,16 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                     const int64_t r = std::min(b0, q + piece);
                     const auto tq = Clock::now();
                     if (!sp.run(ids.data() + q, r - q, q, e)) return false;
+                    // a step far slower than the norm means the engine is starving over the
+                    // read (an expert- or page-cache storm re-reads under it; two engines on
+                    // one shared-RAM GPU does both): the read holds the control lines, so
+                    // every other request queues behind it and the engine looks frozen.
+                    // STRATA_STEP_GAP_MS moves the bar (0 prints every step) while chasing one.
+                    const double gap_s =
+                        std::chrono::duration<double, std::milli>(Clock::now() - tq).count() / 1000.0;
+                    if (gap_s * 1000.0 > step_gap_warn_ms)
+                        std::fprintf(stderr, "talus batch: read step %lld..%lld took %.1f s\n",
+                                     (long long) q, (long long) r, gap_s);
                     q = r;
                     if (q >= b0) continue;
                     int ys = -1;

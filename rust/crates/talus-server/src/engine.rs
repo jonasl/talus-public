@@ -4587,14 +4587,8 @@ impl Engine for StdioSubprocessEngine {
             bus = handle.bus.clone();
             sink = StdinSink(handle.stdin.clone());
         }
-        let go_solo_first = self.parallel_solo.load(Ordering::Relaxed)
-            && req.max_new_tokens > 1
-            && bus.slots_idle()
-            && self.waiters.count() == 0;
-        let use_slot_prefill = self.slot_prefill()
-            && !go_solo_first
-            && req.embeddings.is_none()
-            && req.sampling.json_schema.is_none();
+        let use_slot_prefill =
+            self.slot_prefill() && req.embeddings.is_none() && req.sampling.json_schema.is_none();
         if use_slot_prefill {
             drop(slot.take());
         }

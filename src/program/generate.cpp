@@ -13007,6 +13007,10 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                 }
             }
 
+            stop_req.store(false);   // BPREFILL uses BSTOP <slot>; clear any stale STOP from an earlier GEN/GENI
+            if (g_qwen4exp_rust_driver != nullptr && g_qwen4exp_rust_driver->clear_stop != nullptr) {
+                g_qwen4exp_rust_driver->clear_stop(g_qwen4exp_rust_driver->user_data);
+            }
             bs[(size_t) slot] = std::move(new_sl);
             std::printf("BPRESUME %d %lld\n", slot, (long long) resume);
             std::fflush(stdout);
@@ -13145,6 +13149,7 @@ static int qwen4exp_engine_main(int argc, char** argv) {
             struct SlotHookGuard {
                 std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_ch;
                 std::function<bool(int64_t, std::string&)>& b_hook;
+                std::function<bool()> orig_should_stop;
                 strata::prefill::Prefill& sp_ref;
                 strata::core::SessionState* orig_ss;
                 std::atomic<bool>& ov_stop_ref;
@@ -13155,10 +13160,12 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                     if (ov_thr_ref.joinable()) ov_thr_ref.join();
                     on_ch = nullptr;
                     b_hook = nullptr;
+                    sp_ref.should_stop = std::move(orig_should_stop);
                     sp_ref.set_session(orig_ss);
                     strata::core::progress().busy.store(prev_busy_val, std::memory_order_relaxed);
                 }
-            } sguard{slot_on_chunk_hook, batch_chunk_hook, sp, &ss, ov_stop, ov_thr, prev_busy};
+            } sguard{slot_on_chunk_hook, batch_chunk_hook, std::move(sp.should_stop), sp, &ss, ov_stop, ov_thr, prev_busy};
+            sp.should_stop = nullptr;   // BPREFILL is cancelled per-slot via BSTOP <slot>, not via STOP
 
             sl.pf_chunk_t0 = Clock::now();
             slot_on_chunk_hook = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {

@@ -461,15 +461,20 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     // it (the commit is only needed by the next window, and now runs beside the draft).  R9700, UD-Q4_K_XL: draft wall
     // 5.8 -> 3.5 ms a window (notes-latency.md).
     {
-        static const bool hip_prio = [] {
-            if (const char* v = std::getenv("STRATA_MTP_HIP_PRIO"); v != nullptr && *v != 0) return std::atoi(v) != 0;
+        const char* env_p = std::getenv("STRATA_MTP_HIP_PRIO");
+        bool hip_prio = false;
+        if (env_p != nullptr && *env_p != 0) {
+            hip_prio = std::atoi(env_p) != 0;
+        } else {
             int dev = 0;
             cudaDeviceProp prop{};
-            return cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&prop, dev) == cudaSuccess &&
-                   strata::kernels::gfx_arch_is_gfx12(prop.gcnArchName);
-        }();
+            if (cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
+                hip_prio = strata::kernels::gfx_arch_is_gfx12(prop.gcnArchName) ||
+                           (shared == nullptr && strata::kernels::gfx_arch_is_gfx1151(prop.gcnArchName));
+            }
+        }
         int lo = 0, hi = 0;
-        if (hip_prio && hipDeviceGetStreamPriorityRange(&lo, &hi) == hipSuccess)
+        if (hip_prio && hipDeviceGetStreamPriorityRange(&lo, &hi) == hipSuccess && hi != lo)
             prio = hipStreamCreateWithPriority(&cs_, hipStreamNonBlocking, hi) == hipSuccess;
         (void) cudaGetLastError();
     }

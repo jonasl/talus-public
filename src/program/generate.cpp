@@ -4853,7 +4853,8 @@ static int qwen4exp_engine_main(int argc, char** argv) {
             // runs on the first stage, as for the solo drafter (`mtp.set_ple_session(&ss)` above).
             for (int b = 0; b < o.batch; ++b) {
                 auto d = std::make_unique<strata::core::MtpDrafter>();
-                if (!d->load(o.mtp, draft_geometry, *bslot_ss.back()[(size_t) b], o.spec, err, o.mtp_window, &mtp)) {
+                const int slot_mtp_t = std::min(o.spec, strata::kernels::kVerifyMaxTBase);
+                if (!d->load(o.mtp, draft_geometry, *bslot_ss.back()[(size_t) b], slot_mtp_t, err, o.mtp_window, &mtp)) {
                     std::fprintf(stderr, "talus generate: batch MTP slot %d: %s%s\n", b, err.c_str(),
                                  vram_free_note().c_str());
                     return 1;
@@ -10383,7 +10384,7 @@ static int qwen4exp_engine_main(int argc, char** argv) {
         struct BSlot {
             bool active = false, stop = false;
             int32_t x = 0;                 ///< the token the next window feeds (not yet in the slot's state)
-            std::array<int32_t, strata::kernels::kVerifyMaxTBase> draft{}; ///< the slot's next MTP proposal
+            std::array<int32_t, strata::kernels::kVerifyMaxT> draft{}; ///< the slot's next MTP proposal
             bool draft_ready = false;
             int64_t p = 0;                 ///< its position
             int64_t produced = 0, max_new = 0;

@@ -250,4 +250,5 @@ The XDNA2 NPU kernel artifacts and AIE build sources in `tools/npu/` (`final_409
 
 - `final_4096x2560x1024_128x64x128.xclbin` and `insts_4096x2560x1024_128x64x128.txt` — `MIT` (`Copyright (c) 2026 gufo contributors`).
 - `mm_bfp_mixed.cc` and `n32_core_placed.py` — `Apache-2.0 WITH LLVM-exception` (`Copyright (C) 2026, Advanced Micro Devices, Inc.`, MLIR-AIE).
+- `mm_bfp_atb.cc`, `n32_core_atb.py`, `talus_npu_aie2p.xclbin`, and `insts_{512,1024,2048,4096}x2560x1024.bin` — derived from [Xilinx/mlir-aie](https://github.com/Xilinx/mlir-aie) `v1.4.5` (`programming_examples/ml/block_datatypes/gemm_asymmetric_tile_buffering/config3`), `Apache-2.0 WITH LLVM-exception` (`Copyright (C) 2026 Advanced Micro Devices, Inc.`), compiled with `mlir_aie==1.4.5` + `llvm-aie`.
 

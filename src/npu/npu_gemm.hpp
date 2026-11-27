@@ -16,6 +16,7 @@ public:
     struct Config {
         std::string xclbin;
         std::string insts;
+        std::string kernel_name{"MLIR_AIE"};
         std::uint32_t tokens{4096};
         std::uint32_t k{2560};
         std::uint32_t n{1024};
@@ -30,6 +31,16 @@ public:
     NpuGemm(const NpuGemm&) = delete;
     NpuGemm& operator=(const NpuGemm&) = delete;
 
+    int RegisterKernel(
+        const std::string& kernel_name,
+        const std::string& insts_path,
+        std::uint32_t tokens,
+        std::uint32_t k,
+        std::uint32_t n,
+        std::string* error
+    );
+    int FindKernel(std::uint32_t tokens, std::uint32_t k, std::uint32_t n) const noexcept;
+
     std::size_t ABytes() const noexcept;
     std::size_t BBytes() const noexcept;
     std::size_t CBytes() const noexcept;
@@ -43,6 +54,7 @@ public:
     hipStream_t StageStream() const noexcept;
 
     bool Submit(hipStream_t ready_stream, int a_id, const int* b_ids, const int* c_ids, int count);
+    bool SubmitKernel(int kernel_id, hipStream_t ready_stream, int a_id, const int* b_ids, const int* c_ids, int count);
     bool Wait(hipStream_t consumer_stream);
 
     bool Healthy() const noexcept;

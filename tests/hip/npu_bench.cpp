@@ -99,14 +99,14 @@ bool TestStagingAndPacking(hipStream_t stream) {
     return true;
 }
 
-bool TestNpuHardware(const std::string& xclbin, const std::string& insts, int iters, hipStream_t stream) {
+bool TestNpuHardware(const std::string& xclbin, const std::string& insts, uint32_t tokens, uint32_t k_dim, uint32_t n_dim, int iters, hipStream_t stream) {
     talus_npu_config_t cfg{};
     talus_npu_config_default(&cfg);
     cfg.xclbin_path = xclbin.c_str();
     cfg.insts_path = insts.c_str();
-    cfg.tokens = 4096;
-    cfg.k = 2560;
-    cfg.n = 1024;
+    cfg.tokens = tokens;
+    cfg.k = k_dim;
+    cfg.n = n_dim;
 
     char err[512] = {};
     talus_npu_ctx* ctx = nullptr;
@@ -268,7 +268,7 @@ bool TestNpuHardware(const std::string& xclbin, const std::string& insts, int it
     }
 
     // 2b. Bitwise parity test for gdn_recurrence_npu reading z_streams directly vs decoded z
-    {
+    if (N == 1024) {
         constexpr int64_t gdn_T = 512;
         constexpr int64_t HV = 48, S = 128, ZV = HV * S, C_CH = 10240;
         constexpr size_t state_elems = size_t{HV} * S * S;
@@ -424,12 +424,16 @@ bool TestNpuHardware(const std::string& xclbin, const std::string& insts, int it
 
 int main(int argc, char** argv) {
     std::string xclbin, insts;
+    uint32_t tokens = 4096, k_dim = 2560, n_dim = 1024;
     int iters = 8;
     bool require_npu = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--xclbin" && i + 1 < argc) xclbin = argv[++i];
         else if (a == "--insts" && i + 1 < argc) insts = argv[++i];
+        else if (a == "--tokens" && i + 1 < argc) tokens = static_cast<uint32_t>(std::max(1, std::atoi(argv[++i])));
+        else if (a == "--k" && i + 1 < argc) k_dim = static_cast<uint32_t>(std::max(1, std::atoi(argv[++i])));
+        else if (a == "--n" && i + 1 < argc) n_dim = static_cast<uint32_t>(std::max(1, std::atoi(argv[++i])));
         else if (a == "--iters" && i + 1 < argc) iters = std::max(1, std::atoi(argv[++i]));
         else if (a == "--require-npu") require_npu = true;
     }
@@ -457,7 +461,7 @@ int main(int argc, char** argv) {
     }
 
     if (!xclbin.empty() && !insts.empty()) {
-        if (!TestNpuHardware(xclbin, insts, iters, stream)) {
+        if (!TestNpuHardware(xclbin, insts, tokens, k_dim, n_dim, iters, stream)) {
             (void)hipStreamDestroy(stream);
             return require_npu ? 1 : 0;
         }

@@ -804,14 +804,17 @@ int tk_qwen4exp_p2_npu_init(void* wt, char* err, size_t err_cap) {
 }
 
 int tk_qwen4exp_p2_npu_gdn_qkv_start(void* cs, void* gemm, int64_t layer, const tk_qwen4exp_p2_weight_t* wqkv,
-                                     const uint16_t* mixed_h, int64_t t_n, int64_t* qkv_gpu_cols_out) {
+                                     const uint16_t* mixed_h, int64_t t_n, int64_t* qkv_gpu_cols_out,
+                                     int64_t* npu_rows_out) {
 #ifdef STRATA_USE_HIP
     std::string e;
     talus::npu::PrefillNpu* npu = talus::npu::PrefillNpu::GetOrCreate(&e);
     if (!npu) return 0;
-    return npu->StartGdnQkv(cs, (pf::Gemm*) gemm, layer, npu_wdesc(wqkv), mixed_h, t_n, qkv_gpu_cols_out) ? 1 : 0;
+    return npu->StartGdnQkv(cs, (pf::Gemm*) gemm, layer, npu_wdesc(wqkv), mixed_h, t_n, qkv_gpu_cols_out,
+                            npu_rows_out) ? 1 : 0;
 #else
     (void) cs; (void) gemm; (void) layer; (void) wqkv; (void) mixed_h; (void) t_n; (void) qkv_gpu_cols_out;
+    (void) npu_rows_out;
     return 0;
 #endif
 }
@@ -829,14 +832,17 @@ int tk_qwen4exp_p2_npu_gdn_qkv_finish(void* cs, float* qkv_dev, int64_t t_n) {
 }
 
 int tk_qwen4exp_p2_npu_gdn_start(void* cs, void* gemm, int64_t layer, const tk_qwen4exp_p2_weight_t* wg,
-                                 const uint16_t* mixed_h, int64_t t_n, int64_t* z_gpu_cols_out) {
+                                 const uint16_t* mixed_h, int64_t t_n, int64_t* z_gpu_cols_out,
+                                 int64_t* npu_rows_out) {
 #ifdef STRATA_USE_HIP
     std::string e;
     talus::npu::PrefillNpu* npu = talus::npu::PrefillNpu::GetOrCreate(&e);
     if (!npu) return 0;
-    return npu->StartGdnZ(cs, (pf::Gemm*) gemm, layer, npu_wdesc(wg), mixed_h, t_n, z_gpu_cols_out) ? 1 : 0;
+    return npu->StartGdnZ(cs, (pf::Gemm*) gemm, layer, npu_wdesc(wg), mixed_h, t_n, z_gpu_cols_out,
+                          npu_rows_out) ? 1 : 0;
 #else
     (void) cs; (void) gemm; (void) layer; (void) wg; (void) mixed_h; (void) t_n; (void) z_gpu_cols_out;
+    (void) npu_rows_out;
     return 0;
 #endif
 }
@@ -855,14 +861,17 @@ void tk_qwen4exp_p2_npu_gdn_recurrence(float* state, const float* h, const float
 }
 
 int tk_qwen4exp_p2_npu_qsa_start(void* cs, void* gemm, int64_t layer, const tk_qwen4exp_p2_weight_t* wq,
-                                 const uint16_t* mixed_h, int64_t t_n, int64_t* q_gpu_cols_out) {
+                                 const uint16_t* mixed_h, int64_t t_n, int64_t* q_gpu_cols_out,
+                                 int64_t* npu_rows_out) {
 #ifdef STRATA_USE_HIP
     std::string e;
     talus::npu::PrefillNpu* npu = talus::npu::PrefillNpu::GetOrCreate(&e);
     if (!npu) return 0;
-    return npu->StartQsaQ(cs, (pf::Gemm*) gemm, layer, npu_wdesc(wq), mixed_h, t_n, q_gpu_cols_out) ? 1 : 0;
+    return npu->StartQsaQ(cs, (pf::Gemm*) gemm, layer, npu_wdesc(wq), mixed_h, t_n, q_gpu_cols_out,
+                          npu_rows_out) ? 1 : 0;
 #else
     (void) cs; (void) gemm; (void) layer; (void) wq; (void) mixed_h; (void) t_n; (void) q_gpu_cols_out;
+    (void) npu_rows_out;
     return 0;
 #endif
 }
@@ -879,15 +888,46 @@ int tk_qwen4exp_p2_npu_qsa_finish(void* cs, float* qf_dev, int64_t t_n) {
 #endif
 }
 
-int tk_qwen4exp_p2_npu_moe_shexp_start(void* cs, void* gemm, int64_t layer, const tk_qwen4exp_p2_weight_t* wsg,
-                                       const tk_qwen4exp_p2_weight_t* wsu, const uint16_t* mixed_h, int64_t t_n) {
+int tk_qwen4exp_p2_npu_out_start(void* cs, void* gemm, int64_t layer, const tk_qwen4exp_p2_weight_t* wo,
+                                 const uint16_t* act_h, int64_t t_n, int64_t ldx, int64_t* out_gpu_cols_out,
+                                 int64_t* npu_rows_out) {
 #ifdef STRATA_USE_HIP
     std::string e;
     talus::npu::PrefillNpu* npu = talus::npu::PrefillNpu::GetOrCreate(&e);
     if (!npu) return 0;
-    return npu->StartMoeShexp(cs, (pf::Gemm*) gemm, layer, npu_wdesc(wsg), npu_wdesc(wsu), mixed_h, t_n) ? 1 : 0;
+    return npu->StartOutProj(cs, (pf::Gemm*) gemm, layer, npu_wdesc(wo), act_h, t_n, ldx, out_gpu_cols_out,
+                             npu_rows_out) ? 1 : 0;
+#else
+    (void) cs; (void) gemm; (void) layer; (void) wo; (void) act_h; (void) t_n; (void) ldx;
+    (void) out_gpu_cols_out; (void) npu_rows_out;
+    return 0;
+#endif
+}
+
+int tk_qwen4exp_p2_npu_out_finish(void* cs, float* bo_dev, int64_t t_n) {
+#ifdef STRATA_USE_HIP
+    std::string e;
+    talus::npu::PrefillNpu* npu = talus::npu::PrefillNpu::GetOrCreate(&e);
+    if (!npu) return 0;
+    return npu->FinishOutProj(cs, bo_dev, t_n) ? 1 : 0;
+#else
+    (void) cs; (void) bo_dev; (void) t_n;
+    return 0;
+#endif
+}
+
+int tk_qwen4exp_p2_npu_moe_shexp_start(void* cs, void* gemm, int64_t layer, const tk_qwen4exp_p2_weight_t* wsg,
+                                       const tk_qwen4exp_p2_weight_t* wsu, const uint16_t* mixed_h, int64_t t_n,
+                                       int64_t* npu_rows_out) {
+#ifdef STRATA_USE_HIP
+    std::string e;
+    talus::npu::PrefillNpu* npu = talus::npu::PrefillNpu::GetOrCreate(&e);
+    if (!npu) return 0;
+    return npu->StartMoeShexp(cs, (pf::Gemm*) gemm, layer, npu_wdesc(wsg), npu_wdesc(wsu), mixed_h, t_n,
+                              npu_rows_out) ? 1 : 0;
 #else
     (void) cs; (void) gemm; (void) layer; (void) wsg; (void) wsu; (void) mixed_h; (void) t_n;
+    (void) npu_rows_out;
     return 0;
 #endif
 }

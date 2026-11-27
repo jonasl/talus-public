@@ -31,7 +31,7 @@ public:
     void SetContext(const void* wt_ptr);
 
     // GDN: offloads trailing columns of `attn_qkv.weight` (`qkv`: [t_n, 10240]).
-    // On success returns true, sets `qkv_gpu_cols_out` (columns GPU must compute into `qkv`).
+    // On success returns true, sets `qkv_gpu_cols_out` and optionally `npu_rows_out` (<= t_n).
     bool StartGdnQkv(
         void* cs,
         strata::prefill::Gemm* gemm,
@@ -39,13 +39,13 @@ public:
         const WeightDesc& wqkv,
         const uint16_t* mixed_h,
         int64_t t_n,
-        int64_t* qkv_gpu_cols_out
+        int64_t* qkv_gpu_cols_out,
+        int64_t* npu_rows_out = nullptr
     );
     bool FinishGdnQkv(void* cs, float* qkv_dev, int64_t t_n);
 
     // GDN: offloads trailing columns of `attn_gate.weight` (`z`: [t_n, 6144]).
     // Reuses already-encoded activation buffers from `StartGdnQkv` when called for the same layer/t_n.
-    // On success returns true, sets `z_gpu_cols_out` (columns GPU must compute into `z`).
     bool StartGdnZ(
         void* cs,
         strata::prefill::Gemm* gemm,
@@ -53,7 +53,8 @@ public:
         const WeightDesc& wg,
         const uint16_t* mixed_h,
         int64_t t_n,
-        int64_t* z_gpu_cols_out
+        int64_t* z_gpu_cols_out,
+        int64_t* npu_rows_out = nullptr
     );
     void GdnRecurrence(
         float* state, const float* h, const float* gate, const float* beta, const float* z,
@@ -70,9 +71,24 @@ public:
         const WeightDesc& wq,
         const uint16_t* mixed_h,
         int64_t t_n,
-        int64_t* q_gpu_cols_out
+        int64_t* q_gpu_cols_out,
+        int64_t* npu_rows_out = nullptr
     );
     bool FinishQsaQ(void* cs, float* qf_dev, int64_t t_n);
+
+    // Attention / GDN output projection (`ssm_out.weight` or `attn_output.weight`: [t_n, 6144] -> [t_n, 2560]).
+    bool StartOutProj(
+        void* cs,
+        strata::prefill::Gemm* gemm,
+        int64_t layer,
+        const WeightDesc& wo,
+        const uint16_t* act_h,
+        int64_t t_n,
+        int64_t ldx,
+        int64_t* out_gpu_cols_out,
+        int64_t* npu_rows_out = nullptr
+    );
+    bool FinishOutProj(void* cs, float* bo_dev, int64_t t_n);
 
     // MoE shared expert: offloads `ffn_gate_shexp` + `ffn_up_shexp` and fuses SiLU+mul directly to FP16 `sh_h`.
     bool StartMoeShexp(
@@ -82,7 +98,8 @@ public:
         const WeightDesc& wsg,
         const WeightDesc& wsu,
         const uint16_t* mixed_h,
-        int64_t t_n
+        int64_t t_n,
+        int64_t* npu_rows_out = nullptr
     );
     bool FinishMoeShexp(void* cs, uint16_t* sh_h_dev, int64_t t_n);
 

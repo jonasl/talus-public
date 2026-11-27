@@ -31,6 +31,7 @@ typedef struct talus_npu_config {
     int32_t isolate;        /**< 0 = zero-copy hipHostMalloc+XRT shared BO, 1 = private BO + copy. */
     int32_t keepalive;      /**< 1 = 1s heartbeat prevents D3hot wakeups, 0 = off. */
     int32_t allow_unheld_fclk; /**< 1 = allow auto pp_dpm_fclk (AMD PI 1.0.0.2c+), 0 = require held fclk. */
+    const char* kernel_name; /**< Optional kernel name in xclbin (NULL = "MLIR_AIE"). */
 } talus_npu_config_t;
 
 typedef struct talus_npu_stats {
@@ -91,6 +92,35 @@ void* talus_npu_stage_stream(const talus_npu_ctx* ctx);
  */
 int32_t talus_npu_submit(
     talus_npu_ctx* ctx,
+    void* ready_stream,
+    int32_t a_id,
+    const int32_t* b_ids,
+    const int32_t* c_ids,
+    int32_t count
+);
+
+/**
+ * Register an additional kernel + instruction stream from the already-loaded xclbin.
+ * Returns kernel_id >= 0 on success, or -1 on error.
+ */
+int32_t talus_npu_register_kernel(
+    talus_npu_ctx* ctx,
+    const char* kernel_name,
+    const char* insts_path,
+    uint32_t tokens,
+    uint32_t k,
+    uint32_t n,
+    char* err,
+    size_t err_cap
+);
+
+/** Return kernel_id >= 0 matching `(tokens, k, n)`, or -1 if not registered. */
+int32_t talus_npu_find_kernel(const talus_npu_ctx* ctx, uint32_t tokens, uint32_t k, uint32_t n);
+
+/** Submit `count` NPU GEMM slices using a specific registered `kernel_id`. */
+int32_t talus_npu_submit_kernel(
+    talus_npu_ctx* ctx,
+    int32_t kernel_id,
     void* ready_stream,
     int32_t a_id,
     const int32_t* b_ids,

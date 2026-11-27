@@ -43,10 +43,15 @@ AMD resolved this fabric clock interaction at the firmware level in **AMD PI ver
   - `amdxdna` kernel driver exposing `/dev/accel/accel0`.
   - XRT runtime library `libxrt_coreutil.so.2` + `libxrt_driver_xdna.so.2` installed on the host. No XRT development headers or `mlir-aie` toolchain are required at build time (`libxrt_coreutil.so.2` is loaded via `dlopen`).
   - **Locked memory limit (`RLIMIT_MEMLOCK` / `ulimit -l`)**: XRT's `amdxdna` driver maps a 64 MiB `dev_heap` buffer with `MAP_LOCKED` (in addition to `hipHostMallocMapped` NPU staging BOs). If `ulimit -l` is left at the default 8 MiB (`8192` KB), `xrt::hw_context` creation fails with `mmap(..., len=67108864, ..., flags=8209) failed (err=-11): Resource temporarily unavailable`. Configure `memlock` to `unlimited` (or at least 2 GiB) for the `render` group / user in `/etc/security/limits.d/` (and re-login).
-- **NPU kernel binaries** (bundled in `tools/npu/` from [`ZakFong/f-gufo`](https://github.com/ZakFong/f-gufo/tree/fork-enhancements/tools/npu), alongside AIE sources `mm_bfp_mixed.cc` and `n32_core_placed.py`):
-  - `tools/npu/final_4096x2560x1024_128x64x128.xclbin`
-  - `tools/npu/insts_4096x2560x1024_128x64x128.txt`
-  - Point `TALUS_NPU_DIR=./tools/npu` (or set `TALUS_NPU_XCLBIN` and `TALUS_NPU_INSTS` directly).
+- **NPU kernel binaries** (bundled in `tools/npu/`):
+  - Multi-`M` `mlir-aie` `v1.4.5` ATB kernels (`512x2560x1024`, `1024x2560x1024`, `2048x2560x1024`, `4096x2560x1024`):
+    - `tools/npu/talus_npu_aie2p.xclbin`
+    - `tools/npu/insts_512x2560x1024.bin`, `insts_1024x2560x1024.bin`, `insts_2048x2560x1024.bin`, `insts_4096x2560x1024.bin`
+    - Reproducible build sources: `tools/npu/mm_bfp_atb.cc`, `tools/npu/n32_core_atb.py`, `tools/npu/build_xclbin.sh`
+  - Legacy single-shape fallback (from [`ZakFong/f-gufo`](https://github.com/ZakFong/f-gufo/tree/fork-enhancements/tools/npu), alongside `mm_bfp_mixed.cc` and `n32_core_placed.py`):
+    - `tools/npu/final_4096x2560x1024_128x64x128.xclbin`
+    - `tools/npu/insts_4096x2560x1024_128x64x128.txt`
+  - Point `TALUS_NPU_DIR=./tools/npu` (auto-selects `talus_npu_aie2p.xclbin` when present, or set `TALUS_NPU_XCLBIN` and `TALUS_NPU_INSTS` directly).
 
 ---
 
@@ -70,18 +75,19 @@ TALUS_NPU_DIR=./tools/npu ./build/talus-cli ...
 
 | Variable | Default | Description |
 |---|---|---|
-| `TALUS_NPU_DIR` | unset (off) | Directory containing `final_4096x2560x1024_128x64x128.xclbin` and `insts_4096x2560x1024_128x64x128.txt` (`GUFO_NPU_DIR` accepted as alias) |
-| `TALUS_NPU_XCLBIN` | `<dir>/final_4096x2560x1024_128x64x128.xclbin` | Explicit path to `.xclbin` |
-| `TALUS_NPU_INSTS` | `<dir>/insts_4096x2560x1024_128x64x128.txt` | Explicit path to instruction stream file |
-| `TALUS_NPU_MIN_T` | `2048` | Minimum chunk token count `t_n` eligible for NPU offload |
-| `TALUS_NPU_MAX_GROUPS` | `4` | Maximum `4096`-token groups per chunk (`1..4`, up to `16384` tokens) |
+| `TALUS_NPU_DIR` | unset (off) | Directory containing `talus_npu_aie2p.xclbin` + `insts_*x2560x1024.bin` (or legacy `final_4096x2560x1024_128x64x128.xclbin` + `.txt`; `GUFO_NPU_DIR` accepted as alias) |
+| `TALUS_NPU_XCLBIN` | `<dir>/talus_npu_aie2p.xclbin` | Explicit path to `.xclbin` |
+| `TALUS_NPU_INSTS` | `<dir>/insts_4096x2560x1024.bin` | Explicit path to instruction stream file |
+| `TALUS_NPU_MIN_T` | `1536` (`2048` legacy) | Minimum chunk token count `t_n` eligible for NPU offload |
+| `TALUS_NPU_MAX_GROUPS` | `4` | Maximum NPU groups per chunk (`1..4`, up to `16384` tokens) |
 | `TALUS_NPU_QKV_SLICES` | `-1` (auto, starts at `2`) | Fixed number of `1024`-col slices (`0..10`, auto-tunes `0..6`) offloaded for GDN `attn_qkv` |
 | `TALUS_NPU_Z_SLICES` | `-1` (auto, starts at `2`) | Fixed number of `1024`-col slices (`0..6`) offloaded for GDN `attn_gate` (`z`) |
 | `TALUS_NPU_Q_SLICES` | `-1` (auto, starts at `4`) | Fixed number of `1024`-col slices (`0..12`) offloaded for QSA `attn_q` |
+| `TALUS_NPU_OUT_SLICES` | `0` | Opt-in `1024`-col slices (`0..2`) for `K=6144` `ssm_out`/`attn_output` when `K=6144` kernels are present |
 | `TALUS_NPU_SHEXP` | `1` | `1` = offload MoE `ffn_gate_shexp` + `ffn_up_shexp` with fused SwiGLU, `0` = GPU |
-| `TALUS_NPU_AUTO_TUNE` | `1` | Dynamically adjusts `qkv_slices`, `z_slices`, and `q_slices` based on per-op `host_wait_us_total` |
+| `TALUS_NPU_AUTO_TUNE` | `1` | Dynamically adjusts `qkv_slices`, `z_slices`, and `q_slices` per token-length bucket based on `host_wait_us_total` |
 | `TALUS_NPU_ISOLATE` | `0` | `0` = zero-copy `hipHostMallocMapped` shared BO, `1` = private XRT BO + `CopyPool` |
-| `TALUS_NPU_KEEPALIVE` | `1` | Background 1s heartbeat to prevent `D3hot` wakeups between chunks (`0` = off) |
+| `TALUS_NPU_KEEPALIVE` | `1` | Idle-gated 2s heartbeat (fires for 5s after last NPU submit to avoid `D3hot` wakeups between chunks without stealing decode bandwidth; `0` = off) |
 | `TALUS_NPU_HW_WAIT` | `0` | `1` = use `hipStreamWaitValue32` on mapped completion counter when supported |
 | `TALUS_NPU_TIMEOUT_MS` | `8000` | Per-run XRT wait timeout in milliseconds |
 | `TALUS_NPU_REQUIRE_HELD_FCLK` | `0` | `1` = require held `pp_dpm_fclk` (`manual` top level) before NPU init (legacy pre-`1.0.0.2c` safety guard) |

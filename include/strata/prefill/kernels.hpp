@@ -91,7 +91,7 @@ void gdn_recurrence_npu(float* state, const float* h, const float* gate, const f
                         const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream,
                         int64_t ld16, void (*before_epilogue)(void*), void* before_arg,
                         const uint8_t* const* z_streams, uint32_t z_stream_stride,
-                        uint32_t z_tokens, uint32_t z_gpu_cols);
+                        uint32_t z_tokens, uint32_t z_gpu_cols, uint32_t z_npu_valid_tokens = 0);
 
 // ---- MoE
 /// softmax over 512, top-10 (ties to the lower id), weights renormalised over the ten (the native router).

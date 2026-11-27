@@ -29,6 +29,7 @@ namespace {
 constexpr unsigned kOpcode = 3;
 constexpr std::size_t kBytesPer8 = 9;
 constexpr std::int64_t kHeartbeatQuietMs = 2000;
+constexpr std::int64_t kHeartbeatMaxIdleMs = 5000;
 constexpr std::size_t kMaxInFlight = 4;
 constexpr unsigned kCopyHelpers = 3;
 constexpr std::size_t kParallelCopyMin = std::size_t{1} << 20;
@@ -146,6 +147,7 @@ struct Api {
 
 struct Call {
     hipEvent_t ready_event{nullptr};
+    int kernel_id{0};
     int a_id{-1};
     std::vector<int> b_ids;
     std::vector<int> c_ids;
@@ -294,13 +296,24 @@ struct NpuGemm::Impl {
     xrt_abi::Pimpl device{};
     xrt_abi::Pimpl xclbin{};
     xrt_abi::Pimpl context{};
-    xrt_abi::Pimpl kernel{};
-    xrt_abi::Pimpl instructions{};
-    std::size_t instruction_words{0};
     int group_inst{1};
     int group_a{3};
     int group_b{4};
     int group_c{5};
+
+    struct KernelSlot {
+        std::string name;
+        std::uint32_t tokens{0};
+        std::uint32_t k{0};
+        std::uint32_t n{0};
+        std::size_t a_bytes{0};
+        std::size_t c_bytes{0};
+        xrt_abi::Pimpl kernel{};
+        xrt_abi::Pimpl instructions{};
+        std::size_t instruction_words{0};
+        std::vector<xrt_abi::Pimpl> run_pool;
+    };
+    std::vector<KernelSlot> kernels;
 
     struct Buffer {
         void* host{nullptr};
@@ -317,9 +330,12 @@ struct NpuGemm::Impl {
     std::mutex event_mutex;
     std::size_t event_cursor{0};
 
-    // Pooled reusable xrt::run objects (eliminates per-slice ERT packet allocation overhead)
-    std::vector<xrt_abi::Pimpl> run_pool;
-    std::deque<std::pair<std::size_t, int>> pending;  // (run_pool_idx, c_buf_id)
+    struct PendingRun {
+        int kernel_id{0};
+        std::size_t run_idx{0};
+        int c_id{-1};
+    };
+    std::deque<PendingRun> pending;
     std::vector<xrt_abi::Pimpl> abandoned;
 
     CopyPool copy_pool{kCopyHelpers};
@@ -379,10 +395,12 @@ struct NpuGemm::Impl {
             new std::vector<Buffer>(std::move(buffers));
             return;
         }
-        for (auto& r : run_pool) {
-            if (r.ptr) xrt.run_dtor(&r);
+        for (auto& ks : kernels) {
+            for (auto& r : ks.run_pool) {
+                if (r.ptr) xrt.run_dtor(&r);
+            }
+            ks.run_pool.clear();
         }
-        run_pool.clear();
         for (auto& b : buffers) {
             if (b.has_bo) {
                 xrt.bo_dtor(&b.bo);
@@ -400,8 +418,11 @@ struct NpuGemm::Impl {
             if (ev) (void)hipEventDestroy(ev);
         }
         if (stage_stream) (void)hipStreamDestroy(stage_stream);
-        if (instructions.ptr) xrt.bo_dtor(&instructions);
-        if (kernel.ptr) xrt.kern_dtor(&kernel);
+        for (auto& ks : kernels) {
+            if (ks.instructions.ptr) xrt.bo_dtor(&ks.instructions);
+            if (ks.kernel.ptr) xrt.kern_dtor(&ks.kernel);
+        }
+        kernels.clear();
         if (context.ptr) xrt.hwctx_dtor(&context);
         if (xclbin.ptr) reinterpret_cast<std::shared_ptr<void>*>(&xclbin)->~shared_ptr();
         if (device.ptr) xrt.dev_dtor(&device);
@@ -418,22 +439,24 @@ struct NpuGemm::Impl {
         return ev;
     }
 
-    void CopyToNpu(int id) {
+    void CopyToNpu(int id, std::size_t sync_bytes = 0) {
         const auto t0 = std::chrono::steady_clock::now();
         Buffer& b = buffers[id];
+        const std::size_t bytes = (sync_bytes > 0 && sync_bytes < b.bytes) ? sync_bytes : b.bytes;
         if (config.isolate && b.private_host && b.host) {
-            copy_pool.Copy(b.private_host, b.host, b.bytes);
+            copy_pool.Copy(b.private_host, b.host, bytes);
         }
-        xrt.bo_sync(&b.bo, kXclBoSyncToDevice, b.bytes, 0);
+        xrt.bo_sync(&b.bo, kXclBoSyncToDevice, bytes, 0);
         copy_a_us += Since(t0);
     }
 
-    void CopyFromNpu(int id) {
+    void CopyFromNpu(int id, std::size_t sync_bytes = 0) {
         const auto t0 = std::chrono::steady_clock::now();
         Buffer& b = buffers[id];
-        xrt.bo_sync(&b.bo, kXclBoSyncFromDevice, b.bytes, 0);
+        const std::size_t bytes = (sync_bytes > 0 && sync_bytes < b.bytes) ? sync_bytes : b.bytes;
+        xrt.bo_sync(&b.bo, kXclBoSyncFromDevice, bytes, 0);
         if (config.isolate && b.private_host && b.host) {
-            copy_pool.Copy(b.host, b.private_host, b.bytes);
+            copy_pool.Copy(b.host, b.private_host, bytes);
         }
         copy_c_us += Since(t0);
     }
@@ -450,30 +473,35 @@ struct NpuGemm::Impl {
     }
 
     void ReapOldest() {
-        auto [ridx, c_id] = pending.front();
+        const PendingRun p = pending.front();
         pending.pop_front();
-        Trace("reap_begin", c_id);
+        Trace("reap_begin", p.c_id);
         const auto t0 = std::chrono::steady_clock::now();
-        const bool ok = WaitRun(run_pool[ridx]);
+        KernelSlot& ks = kernels[static_cast<std::size_t>(p.kernel_id)];
+        const bool ok = WaitRun(ks.run_pool[p.run_idx]);
         run_wait_us += Since(t0);
         if (!ok) {
-            abandoned.push_back(run_pool[ridx]);
-            run_pool[ridx] = {};
+            abandoned.push_back(ks.run_pool[p.run_idx]);
+            ks.run_pool[p.run_idx] = {};
         }
-        Trace("reap_done", c_id, ok);
+        Trace("reap_done", p.c_id, ok);
         if (ok) {
-            CopyFromNpu(c_id);
+            CopyFromNpu(p.c_id, ks.c_bytes);
         }
     }
 
     bool Heartbeat() {
         const std::lock_guard lock(mutex);
-        if (failed.load() || heartbeat_a < 0) return false;
+        if (failed.load() || heartbeat_a < 0 || kernels.empty()) return false;
         if (!pending.empty()) return true;
-        if (NowMs() - last_submit_ms.load() < kHeartbeatQuietMs) return true;
+        const std::int64_t last_ms = last_submit_ms.load();
+        const std::int64_t now_ms = NowMs();
+        if (last_ms > 0 && (now_ms - last_ms < kHeartbeatQuietMs || now_ms - last_ms > kHeartbeatMaxIdleMs)) {
+            return true;
+        }
         try {
             Trace("heartbeat_fire");
-            xrt_abi::Pimpl& r = run_pool[0];
+            xrt_abi::Pimpl& r = kernels[0].run_pool[0];
             xrt.run_set_bo(&r, 3, &buffers[heartbeat_a].bo);
             xrt.run_set_bo(&r, 4, &buffers[heartbeat_b].bo);
             xrt.run_set_bo(&r, 5, &buffers[heartbeat_c].bo);
@@ -531,20 +559,26 @@ struct NpuGemm::Impl {
         last_submit_ms = NowMs();
         if (failed.load()) return;
         try {
-            CopyToNpu(call.a_id);
+            if (call.kernel_id < 0 || static_cast<std::size_t>(call.kernel_id) >= kernels.size()) {
+                failed = true;
+                last_error = "invalid NPU kernel_id";
+                return;
+            }
+            KernelSlot& ks = kernels[static_cast<std::size_t>(call.kernel_id)];
+            CopyToNpu(call.a_id, ks.a_bytes);
             std::size_t run_cursor = 0;
             for (std::size_t i = 0; i < call.b_ids.size() && !failed.load(); ++i) {
                 while (pending.size() >= kMaxInFlight) {
                     ReapOldest();
                 }
                 const auto t_launch = std::chrono::steady_clock::now();
-                const std::size_t ridx = (run_cursor++) % run_pool.size();
-                xrt_abi::Pimpl& r = run_pool[ridx];
+                const std::size_t ridx = (run_cursor++) % ks.run_pool.size();
+                xrt_abi::Pimpl& r = ks.run_pool[ridx];
                 xrt.run_set_bo(&r, 3, &buffers[call.a_id].bo);
                 xrt.run_set_bo(&r, 4, &buffers[call.b_ids[i]].bo);
                 xrt.run_set_bo(&r, 5, &buffers[call.c_ids[i]].bo);
                 xrt.run_start(&r);
-                pending.emplace_back(ridx, call.c_ids[i]);
+                pending.push_back(PendingRun{call.kernel_id, ridx, call.c_ids[i]});
                 launch_us += Since(t_launch);
                 stat_slices.fetch_add(1, std::memory_order_relaxed);
             }
@@ -579,6 +613,63 @@ struct NpuGemm::Impl {
                          static_cast<unsigned long long>(w),
                          static_cast<unsigned long long>(stat_slices.load(std::memory_order_relaxed)),
                          copy_a_us / w, launch_us / w, run_wait_us / w, copy_c_us / w, wait_us_total / w);
+        }
+    }
+
+    bool LoadKernelSlot(
+        const std::string& kernel_name,
+        const std::string& insts_path,
+        std::uint32_t tokens,
+        std::uint32_t k,
+        std::uint32_t n,
+        std::string* err
+    ) {
+        try {
+            KernelSlot ks;
+            ks.name = kernel_name;
+            ks.tokens = tokens;
+            ks.k = k;
+            ks.n = n;
+            ks.a_bytes = std::size_t{tokens} * k / 8 * kBytesPer8;
+            ks.c_bytes = std::size_t{tokens} * n / 8 * kBytesPer8;
+
+            xrt.kern_ctor(&ks.kernel, &context, ks.name);
+            if (kernels.empty()) {
+                group_inst = xrt.kern_gid(&ks.kernel, 1);
+                group_a = xrt.kern_gid(&ks.kernel, 3);
+                group_b = xrt.kern_gid(&ks.kernel, 4);
+                group_c = xrt.kern_gid(&ks.kernel, 5);
+            }
+            const int inst_gid = xrt.kern_gid(&ks.kernel, 1);
+
+            std::ifstream file(insts_path, std::ios::binary | std::ios::ate);
+            if (!file) {
+                if (ks.kernel.ptr) xrt.kern_dtor(&ks.kernel);
+                if (err) *err = "NPU instruction file not readable: " + insts_path;
+                return false;
+            }
+            const auto size = static_cast<std::size_t>(file.tellg());
+            file.seekg(0);
+            std::vector<char> words(size);
+            file.read(words.data(), static_cast<std::streamsize>(size));
+            ks.instruction_words = size / sizeof(std::uint32_t);
+            xrt.bo_ctor_sz(&ks.instructions, &device, size, kXrtBoCacheable, static_cast<std::uint32_t>(inst_gid));
+            std::memcpy(xrt.bo_map(&ks.instructions), words.data(), size);
+            xrt.bo_sync(&ks.instructions, kXclBoSyncToDevice, size, 0);
+
+            ks.run_pool.resize(kRunPoolSize);
+            const std::uint64_t inst_words_u64 = ks.instruction_words;
+            for (auto& r : ks.run_pool) {
+                xrt.run_ctor(&r, &ks.kernel);
+                xrt.run_set_scalar(&r, 0, &kOpcode, sizeof(kOpcode));
+                xrt.run_set_bo(&r, 1, &ks.instructions);
+                xrt.run_set_scalar(&r, 2, &inst_words_u64, sizeof(inst_words_u64));
+            }
+            kernels.push_back(std::move(ks));
+            return true;
+        } catch (const std::exception& e) {
+            if (err) *err = std::string("NPU kernel setup failed (") + kernel_name + "): " + e.what();
+            return false;
         }
     }
 };
@@ -631,33 +722,13 @@ std::unique_ptr<NpuGemm> NpuGemm::Create(const Config& config, std::string* erro
         i.xrt.xcl_ctor_str(&i.xclbin, xcl_path);
         xrt_abi::Uuid uuid = i.xrt.dev_reg_xclbin(&i.device, &i.xclbin);
         i.xrt.hwctx_ctor(&i.context, &i.device, &uuid, 0 /* shared */);
-        std::string kname = "MLIR_AIE";
-        i.xrt.kern_ctor(&i.kernel, &i.context, kname);
-
-        i.group_inst = i.xrt.kern_gid(&i.kernel, 1);
-        i.group_a = i.xrt.kern_gid(&i.kernel, 3);
-        i.group_b = i.xrt.kern_gid(&i.kernel, 4);
-        i.group_c = i.xrt.kern_gid(&i.kernel, 5);
-
-        std::ifstream file(config.insts, std::ios::binary | std::ios::ate);
-        if (!file) return fail("NPU instruction file not readable: " + config.insts);
-        const auto size = static_cast<std::size_t>(file.tellg());
-        file.seekg(0);
-        std::vector<char> words(size);
-        file.read(words.data(), static_cast<std::streamsize>(size));
-        i.instruction_words = size / sizeof(std::uint32_t);
-        i.xrt.bo_ctor_sz(&i.instructions, &i.device, size, kXrtBoCacheable, static_cast<std::uint32_t>(i.group_inst));
-        std::memcpy(i.xrt.bo_map(&i.instructions), words.data(), size);
-        i.xrt.bo_sync(&i.instructions, kXclBoSyncToDevice, size, 0);
-
-        // Pre-allocate pooled xrt::run handles with fixed args 0, 1, 2
-        i.run_pool.resize(kRunPoolSize);
-        const std::uint64_t inst_words_u64 = i.instruction_words;
-        for (auto& r : i.run_pool) {
-            i.xrt.run_ctor(&r, &i.kernel);
-            i.xrt.run_set_scalar(&r, 0, &kOpcode, sizeof(kOpcode));
-            i.xrt.run_set_bo(&r, 1, &i.instructions);
-            i.xrt.run_set_scalar(&r, 2, &inst_words_u64, sizeof(inst_words_u64));
+        const char* k_env = std::getenv("TALUS_NPU_KERNEL_NAME");
+        std::string kname = (k_env && k_env[0])
+                                ? std::string(k_env)
+                                : (config.kernel_name.empty() ? std::string("MLIR_AIE") : config.kernel_name);
+        std::string kerr;
+        if (!i.LoadKernelSlot(kname, config.insts, config.tokens, config.k, config.n, &kerr)) {
+            return fail(kerr);
         }
     } catch (const std::exception& e) {
         return fail(std::string("NPU setup failed: ") + e.what());
@@ -786,8 +857,44 @@ void NpuGemm::FinalizeWeights(int id) {
     impl_->CopyToNpu(id);
 }
 
+int NpuGemm::RegisterKernel(
+    const std::string& kernel_name,
+    const std::string& insts_path,
+    std::uint32_t tokens,
+    std::uint32_t k,
+    std::uint32_t n,
+    std::string* error
+) {
+    const std::lock_guard lock(impl_->mutex);
+    for (std::size_t idx = 0; idx < impl_->kernels.size(); ++idx) {
+        const auto& ks = impl_->kernels[idx];
+        if (ks.tokens == tokens && ks.k == k && ks.n == n && ks.name == kernel_name) {
+            return static_cast<int>(idx);
+        }
+    }
+    if (!impl_->LoadKernelSlot(kernel_name, insts_path, tokens, k, n, error)) {
+        return -1;
+    }
+    return static_cast<int>(impl_->kernels.size()) - 1;
+}
+
+int NpuGemm::FindKernel(std::uint32_t tokens, std::uint32_t k, std::uint32_t n) const noexcept {
+    for (std::size_t idx = 0; idx < impl_->kernels.size(); ++idx) {
+        const auto& ks = impl_->kernels[idx];
+        if (ks.tokens == tokens && ks.k == k && ks.n == n) {
+            return static_cast<int>(idx);
+        }
+    }
+    return -1;
+}
+
 bool NpuGemm::Submit(hipStream_t ready_stream, int a_id, const int* b_ids, const int* c_ids, int count) {
+    return SubmitKernel(0, ready_stream, a_id, b_ids, c_ids, count);
+}
+
+bool NpuGemm::SubmitKernel(int kernel_id, hipStream_t ready_stream, int a_id, const int* b_ids, const int* c_ids, int count) {
     if (count <= 0) return true;
+    if (kernel_id < 0 || static_cast<std::size_t>(kernel_id) >= impl_->kernels.size()) return false;
     Trace("submit", a_id, count);
     hipEvent_t ev = nullptr;
     if (ready_stream != nullptr) {
@@ -795,7 +902,7 @@ bool NpuGemm::Submit(hipStream_t ready_stream, int a_id, const int* b_ids, const
         if (hipEventRecord(ev, ready_stream) != hipSuccess) return false;
     }
     const std::uint32_t seq = impl_->submit_seq.fetch_add(1, std::memory_order_relaxed) + 1;
-    Call call{ev, a_id, {b_ids, b_ids + count}, {c_ids, c_ids + count}, seq};
+    Call call{ev, kernel_id, a_id, {b_ids, b_ids + count}, {c_ids, c_ids + count}, seq};
     {
         const std::lock_guard lock(impl_->queue_mutex);
         impl_->queue.push_back(std::move(call));

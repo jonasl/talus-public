@@ -88,6 +88,7 @@ int32_t talus_npu_create(const talus_npu_config_t* cfg, talus_npu_ctx** out_ctx,
     talus::npu::NpuGemm::Config c;
     c.xclbin = cfg->xclbin_path;
     c.insts = cfg->insts_path;
+    if (cfg->kernel_name && cfg->kernel_name[0]) c.kernel_name = cfg->kernel_name;
     c.tokens = cfg->tokens ? cfg->tokens : 4096;
     c.k = cfg->k ? cfg->k : 2560;
     c.n = cfg->n ? cfg->n : 1024;
@@ -156,6 +157,28 @@ int32_t talus_npu_submit(talus_npu_ctx* ctx, void* ready_stream, int32_t a_id,
                          const int32_t* b_ids, const int32_t* c_ids, int32_t count) {
     if (!ctx || !ctx->gemm || count <= 0 || !b_ids || !c_ids) return 0;
     return ctx->gemm->Submit(static_cast<hipStream_t>(ready_stream), a_id, b_ids, c_ids, count) ? 1 : 0;
+}
+
+int32_t talus_npu_register_kernel(talus_npu_ctx* ctx, const char* kernel_name, const char* insts_path,
+                                  uint32_t tokens, uint32_t k, uint32_t n, char* err, size_t err_cap) {
+    if (!ctx || !ctx->gemm || !kernel_name || !insts_path) {
+        PutErr(err, err_cap, "talus_npu_register_kernel: invalid null argument");
+        return -1;
+    }
+    std::string e;
+    int id = ctx->gemm->RegisterKernel(kernel_name, insts_path, tokens, k, n, &e);
+    if (id < 0) PutErr(err, err_cap, e);
+    return id;
+}
+
+int32_t talus_npu_find_kernel(const talus_npu_ctx* ctx, uint32_t tokens, uint32_t k, uint32_t n) {
+    return (ctx && ctx->gemm) ? ctx->gemm->FindKernel(tokens, k, n) : -1;
+}
+
+int32_t talus_npu_submit_kernel(talus_npu_ctx* ctx, int32_t kernel_id, void* ready_stream, int32_t a_id,
+                                const int32_t* b_ids, const int32_t* c_ids, int32_t count) {
+    if (!ctx || !ctx->gemm || count <= 0 || !b_ids || !c_ids) return 0;
+    return ctx->gemm->SubmitKernel(kernel_id, static_cast<hipStream_t>(ready_stream), a_id, b_ids, c_ids, count) ? 1 : 0;
 }
 
 int32_t talus_npu_wait(talus_npu_ctx* ctx, void* consumer_stream) {

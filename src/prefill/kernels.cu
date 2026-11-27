@@ -1740,7 +1740,8 @@ template <bool WY>
 __global__ void __launch_bounds__(S) gdn_out_norm_npu_kernel(
     const float* __restrict__ z, const float* __restrict__ gamma, float eps, float* __restrict__ y,
     uint16_t* __restrict__ y16, int64_t rows, int64_t ld16,
-    const uint8_t* const* z_streams, uint32_t z_stream_stride, uint32_t z_tokens, uint32_t z_gpu_cols) {
+    const uint8_t* const* z_streams, uint32_t z_stream_stride, uint32_t z_tokens, uint32_t z_gpu_cols,
+    uint32_t z_npu_valid_tokens) {
     __shared__ float wsum[4];
     const int col = threadIdx.x;
     for (int64_t row = blockIdx.x; row < rows; row += gridDim.x) {
@@ -1756,7 +1757,7 @@ __global__ void __launch_bounds__(S) gdn_out_norm_npu_kernel(
         const int64_t t = row / HV;
         const uint32_t gcol = static_cast<uint32_t>((row % HV) * S + col);
         float zv;
-        if (z_streams != nullptr && gcol >= z_gpu_cols) {
+        if (z_streams != nullptr && gcol >= z_gpu_cols && static_cast<uint32_t>(t) < z_npu_valid_tokens) {
             const uint32_t ncol = gcol - z_gpu_cols;
             const uint32_t g = static_cast<uint32_t>(t) / z_tokens;
             const uint32_t tl = static_cast<uint32_t>(t) % z_tokens;
@@ -2743,10 +2744,11 @@ void gdn_recurrence_npu(float* state, const float* h, const float* gate, const f
                         const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream,
                         int64_t ld16, void (*before_epilogue)(void*), void* before_arg,
                         const uint8_t* const* z_streams, uint32_t z_stream_stride,
-                        uint32_t z_tokens, uint32_t z_gpu_cols) {
+                        uint32_t z_tokens, uint32_t z_gpu_cols, uint32_t z_npu_valid_tokens) {
 #if defined(__HIPCC__)
     if (T <= 0) return;
     if (ld16 <= 0) ld16 = (int64_t) HV * S;
+    if (z_npu_valid_tokens == 0) z_npu_valid_tokens = static_cast<uint32_t>(T);
     static const bool head = [] { const char* v = std::getenv("STRATA_GDN_HEAD"); return v != nullptr && std::atoi(v) != 0; }();
     static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;
     if (head && !serial) {
@@ -2771,10 +2773,12 @@ void gdn_recurrence_npu(float* state, const float* h, const float* gate, const f
     const unsigned grid = (unsigned) std::min<int64_t>(T * HV, 4096);
     if (noy)
         gdn_out_norm_npu_kernel<false><<<grid, S, 0, (cudaStream_t) stream>>>(
-            z, gamma, eps, y, y16, T * HV, ld16, z_streams, z_stream_stride, z_tokens, z_gpu_cols);
+            z, gamma, eps, y, y16, T * HV, ld16, z_streams, z_stream_stride, z_tokens, z_gpu_cols,
+            z_npu_valid_tokens);
     else
         gdn_out_norm_npu_kernel<true><<<grid, S, 0, (cudaStream_t) stream>>>(
-            z, gamma, eps, y, y16, T * HV, ld16, z_streams, z_stream_stride, z_tokens, z_gpu_cols);
+            z, gamma, eps, y, y16, T * HV, ld16, z_streams, z_stream_stride, z_tokens, z_gpu_cols,
+            z_npu_valid_tokens);
     check("gdn_recurrence_npu");
 #else
     if (before_epilogue) before_epilogue(before_arg);

@@ -784,7 +784,22 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         return false;
     }
     if (ext_stream_ != nullptr) cs_ = ext_stream_;   // set_stream (pipelined windows): the stage's shared stream
-    else if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) cs_ = nullptr;
+    else {
+        bool cs_prio = false;
+#if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+        {
+            static const bool vp = [] {
+                const char* v = std::getenv("STRATA_VERIFY_HIP_PRIO");
+                return v == nullptr || *v == 0 || std::atoi(v) != 0;
+            }();
+            int lo = 0, hi = 0;
+            if (vp && hipDeviceGetStreamPriorityRange(&lo, &hi) == hipSuccess && hi != lo)
+                cs_prio = hipStreamCreateWithPriority(&cs_, hipStreamNonBlocking, hi) == hipSuccess;
+            (void) cudaGetLastError();
+        }
+#endif
+        if (!cs_prio && cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) cs_ = nullptr;
+    }
     if (cs_ == nullptr || cudaStreamCreateWithFlags(&sh_cs_, cudaStreamNonBlocking) != cudaSuccess) {
         err = "verify: stream create failed";
         return false;

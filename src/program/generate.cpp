@@ -13293,7 +13293,11 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                         }
                         if (!ran) break;
                         const double dt_ms = std::chrono::duration<double, std::milli>(Clock::now() - td0).count();
-                        if (share < 1.0 && dt_ms > 0.0) {
+                        // In overlap mode, GPU batch_step() runs concurrently with NPU+GPU prefill rather than
+                        // blocking it: when no other prefill is queued (share >= 0.5), run decode windows
+                        // continuously instead of sleeping half the time; when other prefills are queued
+                        // (share < 0.5), pace decode windows to preserve TTFT on the queued prefills.
+                        if (share < 0.5 && dt_ms > 0.0) {
                             double rem_sleep = std::min(500.0, dt_ms * (1.0 - share) / share);
                             while (rem_sleep >= 0.5 && !ov_stop.load(std::memory_order_acquire)) {
                                 const double slice = std::min(5.0, rem_sleep);

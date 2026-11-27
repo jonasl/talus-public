@@ -324,6 +324,153 @@ impl<'a> BatchClient<'a> {
         }
     }
 
+    /// Send a `BPREFILL` directly into a free slot without holding the engine's control lines:
+    /// every reply (`BPRESUME`, `BPP`, `BPT`, `BPDONE`, `BPADMIT`, `BPERR`) arrives on the slot's
+    /// own queue so multiple prompt prefills can register and interleave concurrently.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn admit_prefill(
+        &self,
+        cmd: &dyn Fn(usize) -> String,
+        prompt: &[u32],
+        reserve: &mut dyn FnMut() -> Result<usize, EngineError>,
+        share_update: Option<&dyn Fn() -> Option<f64>>,
+        cancel: &AtomicBool,
+        on_token: &mut dyn FnMut(u32, Option<TokenLogprob>) -> bool,
+        on_progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<Leg, EngineError> {
+        let mut refused = 0usize;
+        'outer: loop {
+            let slot = reserve()?;
+            self.bus.drain_slot(slot);
+            self.bus.set_slot_prefilling(slot, true);
+            let mut last_share = share_update.and_then(|f| f());
+            let line = cmd(slot);
+            if let Err(e) = self.sink.send(&line, None) {
+                self.bus.set_slot_prefilling(slot, false);
+                self.bus.release_done(slot, Vec::new());
+                return Err(e);
+            }
+            let written_at = Instant::now();
+            let mut answered = false;
+            let mut leg = Leg {
+                slot,
+                ..Default::default()
+            };
+            let mut stop_sent = false;
+            let mut aborted = false;
+            loop {
+                match self.bus.recv_slot(slot, CTL_POLL)? {
+                    BusLine::TimedOut => {
+                        if (cancel.load(Ordering::Relaxed) || aborted) && !stop_sent {
+                            if let Err(e) = self.sink.send(&format!("BSTOP {slot}"), None) {
+                                self.bus.set_slot_prefilling(slot, false);
+                                self.bus.release_done(slot, Vec::new());
+                                return Err(e);
+                            }
+                            stop_sent = true;
+                        }
+                        if leg.admission.is_none() && !stop_sent {
+                            if let Some(next) = share_update.and_then(|f| f()) {
+                                if last_share.is_none_or(|prev| (prev - next).abs() > 1e-6) {
+                                    let _ = self.sink.send(&format!("BSHARE {next:.3}"), None);
+                                    last_share = Some(next);
+                                }
+                            }
+                        }
+                    }
+                    BusLine::Ended => {
+                        self.bus.set_slot_prefilling(slot, false);
+                        self.bus.release_done(slot, Vec::new());
+                        let resend = !answered && written_at.elapsed() <= RESEND_WINDOW;
+                        return Err(EngineError::EngineDied(if resend {
+                            ENDED_BEFORE_ANSWERING.to_string()
+                        } else {
+                            "the engine process ended unexpectedly".to_string()
+                        }));
+                    }
+                    BusLine::Line(raw) => {
+                        let trimmed = raw.trim();
+                        answered = true;
+                        if let Some(rest) = trimmed.strip_prefix("BPRESUME ") {
+                            let f: Vec<&str> = rest.split_whitespace().collect();
+                            leg.reused =
+                                f.get(1).and_then(|x| x.parse::<usize>().ok()).unwrap_or(0);
+                        } else if let Some(rest) = trimmed.strip_prefix("BPP ") {
+                            let f: Vec<&str> = rest.split_whitespace().collect();
+                            if let (Some(done), Some(total)) = (
+                                f.get(1).and_then(|x| x.parse::<usize>().ok()),
+                                f.get(2).and_then(|x| x.parse::<usize>().ok()),
+                            ) {
+                                on_progress(done, total);
+                            }
+                            if leg.admission.is_none() && !stop_sent {
+                                if let Some(next) = share_update.and_then(|f| f()) {
+                                    if last_share.is_none_or(|prev| (prev - next).abs() > 1e-6) {
+                                        let _ = self.sink.send(&format!("BSHARE {next:.3}"), None);
+                                        last_share = Some(next);
+                                    }
+                                }
+                            }
+                        } else if let Some(rest) = trimmed.strip_prefix("BPT ") {
+                            let f: Vec<&str> = rest.split_whitespace().collect();
+                            if let Some(tok) = f.get(1).and_then(|x| x.parse::<u32>().ok()) {
+                                leg.admission = Some(tok);
+                                if !on_token(tok, None) {
+                                    aborted = true;
+                                }
+                            }
+                        } else if let Some(rest) = trimmed.strip_prefix("BPDONE ") {
+                            let f: Vec<&str> = rest.split_whitespace().collect();
+                            leg.prompt_n =
+                                f.get(1).and_then(|x| x.parse::<usize>().ok()).unwrap_or(0);
+                            leg.prompt_ms =
+                                f.get(2).and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0);
+                            leg.predicted_ms =
+                                f.get(3).and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0);
+                            leg.finish = f.get(4).unwrap_or(&"").to_string();
+                            leg.done_reused = f.get(5).and_then(|x| x.parse::<usize>().ok());
+                        } else if let Some(rest) = trimmed.strip_prefix("BPADMIT ") {
+                            self.bus.set_slot_prefilling(slot, false);
+                            let f: Vec<&str> = rest.split_whitespace().collect();
+                            leg.cont = f.get(1).is_some_and(|x| *x == "1");
+                            if (cancel.load(Ordering::Relaxed) || aborted) && leg.cont {
+                                self.sink.send(&format!("BSTOP {slot}"), None)?;
+                                let mut stream = prompt.to_vec();
+                                stream.extend(leg.admission.iter().copied());
+                                self.bus.begin_release(slot, stream);
+                                leg.cancelled = true;
+                            }
+                            if !leg.cont {
+                                self.bus.release_done(
+                                    slot,
+                                    slot_holds(prompt, leg.admission.as_slice(), &leg.finish),
+                                );
+                            }
+                            return Ok(leg);
+                        } else if let Some(rest) = trimmed.strip_prefix("BPERR ") {
+                            self.bus.set_slot_prefilling(slot, false);
+                            let why = rest
+                                .split_once(' ')
+                                .map(|(_, msg)| msg.trim())
+                                .unwrap_or(rest.trim());
+                            if why.contains("is busy")
+                                && refused < BGEN_REFUSALS_MAX
+                                && !cancel.load(Ordering::Relaxed)
+                                && !aborted
+                            {
+                                self.bus.unclaim_park(slot);
+                                refused += 1;
+                                continue 'outer;
+                            }
+                            self.bus.release_done(slot, Vec::new());
+                            return Err(EngineError::InvalidRequest(why.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Read a slot's own lines to its `BDONE`. `emitted` is what the engine has so far - the
     /// admission's token first, then the `BT` tokens; the slot's `BDONE` counts all of it. A
     /// set `cancel` sends `BSTOP` once and absorbs the rest until the `BDONE` (there is no ack,
@@ -1276,5 +1423,178 @@ mod tests {
             .unwrap();
         assert_eq!(toks, vec![42]);
         assert!(!leg.cont);
+    }
+
+    #[test]
+    fn admit_prefill_interleaves_two_slots_and_reports_timings() {
+        let (bus, feeder) = EngineBus::manual(2);
+        let (tx, rx) = mpsc::channel::<String>();
+        let sink = ScriptSink(tx);
+        let prompt_a: Vec<u32> = (10..30).collect();
+        let prompt_b: Vec<u32> = (40..50).collect();
+
+        std::thread::spawn(move || {
+            let mut cmds = [rx.recv().unwrap(), rx.recv().unwrap()];
+            cmds.sort();
+            assert!(cmds[0].starts_with("BPREFILL 0 "));
+            assert!(cmds[1].starts_with("BPREFILL 1 "));
+
+            feeder.push("BPRESUME 0 4");
+            feeder.push("BPP 0 12 20 50.0 160.0");
+            feeder.push("BPRESUME 1 0");
+            feeder.push("BPP 1 9 10 20.0 450.0");
+            feeder.push("BPT 1 77");
+            feeder.push("BPDONE 1 10 25.0 3.0 length 0 10");
+            feeder.push("BPADMIT 1 1");
+            feeder.push("BT 1 78");
+            feeder.push("BDONE 1 2 stop 5.0");
+
+            feeder.push("BPP 0 19 20 100.0 150.0");
+            feeder.push("BPT 0 88");
+            feeder.push("BPDONE 0 20 110.0 4.0 length 4 16");
+            feeder.push("BPADMIT 0 0");
+        });
+
+        let a = {
+            let bus = bus.clone();
+            let sink = ScriptSink(sink.0.clone());
+            let prompt_a = prompt_a.clone();
+            std::thread::spawn(move || {
+                let client = BatchClient {
+                    bus: &bus,
+                    sink: &sink,
+                    groups: 1,
+                };
+                let cancel = AtomicBool::new(false);
+                let mut toks = Vec::new();
+                let mut prog = Vec::new();
+                let leg = client
+                    .admit_prefill(
+                        &|s| format!("BPREFILL {s} 1 10,11"),
+                        &prompt_a,
+                        &mut || Ok(0),
+                        None,
+                        &cancel,
+                        &mut |t, _| {
+                            toks.push(t);
+                            true
+                        },
+                        &mut |d, tot| prog.push((d, tot)),
+                    )
+                    .unwrap();
+                (leg, toks, prog)
+            })
+        };
+
+        let b = {
+            let bus = bus.clone();
+            let sink = ScriptSink(sink.0.clone());
+            let prompt_b = prompt_b.clone();
+            std::thread::spawn(move || {
+                let client = BatchClient {
+                    bus: &bus,
+                    sink: &sink,
+                    groups: 1,
+                };
+                let cancel = AtomicBool::new(false);
+                let mut toks = Vec::new();
+                let leg = client
+                    .admit_prefill(
+                        &|s| format!("BPREFILL {s} 4 40,41"),
+                        &prompt_b,
+                        &mut || Ok(1),
+                        None,
+                        &cancel,
+                        &mut |t, _| {
+                            toks.push(t);
+                            true
+                        },
+                        &mut |_, _| {},
+                    )
+                    .unwrap();
+                assert!(leg.cont);
+                let initial_toks = toks.clone();
+                let pumped = client
+                    .pump(
+                        1,
+                        &prompt_b,
+                        &initial_toks,
+                        &cancel,
+                        &mut |t| {
+                            toks.push(t);
+                            true
+                        },
+                        None,
+                    )
+                    .unwrap();
+                (leg, pumped, toks)
+            })
+        };
+
+        let (leg_a, toks_a, prog_a) = a.join().unwrap();
+        let (leg_b, pumped_b, toks_b) = b.join().unwrap();
+        assert_eq!(toks_a, vec![88]);
+        assert_eq!(leg_a.reused, 4);
+        assert_eq!(leg_a.prompt_n, 20);
+        assert_eq!(leg_a.done_reused, Some(4));
+        assert_eq!(prog_a, vec![(12, 20), (19, 20)]);
+        assert!(!leg_a.cont);
+
+        assert_eq!(toks_b, vec![77, 78]);
+        assert_eq!(leg_b.prompt_n, 10);
+        assert_eq!(pumped_b.produced, 2);
+        assert_eq!(pumped_b.finish, "stop");
+        assert!(bus.slots_idle());
+    }
+
+    #[test]
+    fn admit_prefill_handles_bshare_and_cancel() {
+        use std::sync::atomic::AtomicUsize;
+        let (bus, feeder) = EngineBus::manual(1);
+        let (tx, rx) = mpsc::channel::<String>();
+        let sink = ScriptSink(tx);
+        let client = BatchClient {
+            bus: &bus,
+            sink: &sink,
+            groups: 1,
+        };
+        let share_state = Arc::new(AtomicUsize::new(0));
+        let share_state_feed = share_state.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_feed = cancel.clone();
+        std::thread::spawn(move || {
+            let cmd = rx.recv().unwrap();
+            assert!(cmd.starts_with("BPREFILL 0 "));
+            feeder.push("BPRESUME 0 0");
+            share_state_feed.store(1, Ordering::SeqCst);
+            feeder.push("BPP 0 4096 8192 100.0 40960.0");
+            let bshare = rx.recv().unwrap();
+            assert_eq!(bshare, "BSHARE 0.200");
+            cancel_feed.store(true, Ordering::Relaxed);
+            let bstop = rx.recv().unwrap();
+            assert_eq!(bstop, "BSTOP 0");
+            feeder.push("BPDONE 0 8192 120.0 0.0 cancel 0 4096");
+            feeder.push("BPADMIT 0 0");
+        });
+        let leg = client
+            .admit_prefill(
+                &|s| format!("BPREFILL {s} 4 1,2,3"),
+                &[1, 2, 3],
+                &mut || Ok(0),
+                Some(&|| {
+                    Some(if share_state.load(Ordering::SeqCst) > 0 {
+                        0.2
+                    } else {
+                        0.5
+                    })
+                }),
+                &cancel,
+                &mut |_, _| true,
+                &mut |_, _| {},
+            )
+            .unwrap();
+        assert_eq!(leg.finish, "cancel");
+        assert!(!leg.cont);
+        assert!(bus.slots_idle());
     }
 }

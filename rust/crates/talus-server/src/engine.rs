@@ -2284,6 +2284,8 @@ struct SlotState {
     held: Vec<u32>,
     /// The pick sequence at the last claim of this slot: the picker's "used longest ago" tiebreak.
     last_use: u64,
+    /// True while a `BPREFILL` is running in this slot (for adaptive decode-share queueing).
+    prefilling: bool,
 }
 
 struct BusInner {
@@ -2383,6 +2385,7 @@ impl EngineBus {
                         orphan_since: None,
                         held: Vec::new(),
                         last_use: 0,
+                        prefilling: false,
                     })
                     .collect(),
                 nslots,
@@ -2411,7 +2414,10 @@ impl EngineBus {
         let mut inner = self.inner.lock().unwrap();
         if inner.nslots > 0 {
             let head = line.split_whitespace().next().unwrap_or("");
-            if head == "BT" || head == "BDONE" {
+            if matches!(
+                head,
+                "BT" | "BDONE" | "BPRESUME" | "BPP" | "BPT" | "BPDONE" | "BPADMIT" | "BPERR"
+            ) {
                 if let Some(s) = line
                     .split_whitespace()
                     .nth(1)
@@ -2427,7 +2433,7 @@ impl EngineBus {
                                 {
                                     inner.slot[s].tail.push(t);
                                 }
-                            } else {
+                            } else if head == "BDONE" {
                                 let nonfinite = line
                                     .split_whitespace()
                                     .nth(3)
@@ -2464,6 +2470,7 @@ impl EngineBus {
         st.releasing = false;
         st.busy = false;
         st.claimed = false;
+        st.prefilling = false;
     }
 
     fn pop_sel(inner: &mut BusInner, sel: Sel) -> Option<String> {
@@ -2649,11 +2656,29 @@ impl EngineBus {
 
     /// The engine refused a BGEN (their #1994): keep the slot busy with no owner until the park
     /// ages out; the engine's view of it needs the moment to catch up.
+    pub(crate) fn set_slot_prefilling(&self, slot: usize, on: bool) {
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(st) = guard.slot.get_mut(slot) {
+            st.prefilling = on;
+        }
+    }
+
+    pub(crate) fn prefilling_count(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .slot
+            .iter()
+            .filter(|st| st.prefilling)
+            .count()
+    }
+
     pub(crate) fn unclaim_park(&self, slot: usize) {
         let mut guard = self.inner.lock().unwrap();
         if let Some(st) = guard.slot.get_mut(slot) {
             st.claimed = false;
             st.busy = true;
+            st.prefilling = false;
             st.park_until = Some(
                 Instant::now() + Duration::from_nanos(self.slot_park_ns.load(Ordering::Relaxed)),
             );
@@ -2669,6 +2694,7 @@ impl EngineBus {
         if let Some(st) = guard.slot.get_mut(slot) {
             st.busy = false;
             st.claimed = false;
+            st.prefilling = false;
         }
         self.signal.notify_all();
     }
@@ -2680,6 +2706,7 @@ impl EngineBus {
             st.busy = false;
             st.claimed = false;
             st.releasing = false;
+            st.prefilling = false;
             st.park_until = None;
             st.orphan_since = None;
             st.held_stream.clear();
@@ -3166,10 +3193,15 @@ impl StdioSubprocessEngine {
     }
 
     fn current_decode_share(&self) -> Option<f64> {
+        self.current_decode_share_with(None)
+    }
+
+    fn current_decode_share_with(&self, bus: Option<&EngineBus>) -> Option<f64> {
         if !self.adaptive_decode_share.load(Ordering::Relaxed) {
             return None;
         }
-        Some(if self.waiters.count() > 0 {
+        let queued = self.waiters.count() > 0 || bus.is_some_and(|b| b.prefilling_count() > 1);
+        Some(if queued {
             self.queued_decode_share
         } else {
             self.base_decode_share
@@ -3638,6 +3670,14 @@ impl StdioSubprocessEngine {
             .unwrap_or(false)
     }
 
+    /// Whether the engine accepts `BPREFILL` directly into a batch slot (`INFO slot_prefill=1`).
+    pub fn slot_prefill(&self) -> bool {
+        self.info
+            .get("slot_prefill")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    }
+
     /// Pipelined slot groups the engine resolved (`INFO batch_groups=`, 1 when there is no split):
     /// the slot order that spreads requests across groups, and whether a window spans a slot's group.
     pub fn batch_groups(&self) -> usize {
@@ -4086,6 +4126,43 @@ impl StdioSubprocessEngine {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn admit_slot_prefill(
+        &self,
+        bus: &Arc<EngineBus>,
+        sink: &StdinSink,
+        req: &GenerateRequest,
+        prompt: &[u32],
+        max_new: usize,
+        cancel: &Arc<AtomicBool>,
+        on_token: &mut dyn FnMut(u32, Option<TokenLogprob>) -> bool,
+        on_progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<Leg, EngineError> {
+        let (keys, _frame, csv) = self.gen_body(req, prompt);
+        let cmd = |slot: usize| format!("BPREFILL {slot} {max_new}{keys} {csv}");
+        let client = BatchClient {
+            bus,
+            sink,
+            groups: self.batch_groups(),
+        };
+        let is_stop = |t: u32| self.tok.is_stop_token(t) || req.stop_tokens.contains(&t);
+        client.admit_prefill(
+            &cmd,
+            prompt,
+            &mut || self.reserve_slot_no_proc(bus, sink, prompt, cancel),
+            Some(&|| self.current_decode_share_with(Some(bus))),
+            cancel,
+            &mut |t, lp| {
+                if is_stop(t) && !req.sampling.ignore_eos {
+                    false
+                } else {
+                    on_token(t, lp)
+                }
+            },
+            on_progress,
+        )
+    }
+
     /// Read the slot's leg to its `BDONE` and assemble the figures. The pump holds neither
     /// `proc` nor the control lines: the next request admits while this one streams.
     #[allow(clippy::too_many_arguments)]
@@ -4278,6 +4355,29 @@ impl StdioSubprocessEngine {
         };
         *slot = Some(self.lock_proc(cancel)?);
         Ok(s)
+    }
+
+    fn reserve_slot_no_proc(
+        &self,
+        bus: &Arc<EngineBus>,
+        sink: &StdinSink,
+        prompt: &[u32],
+        cancel: &AtomicBool,
+    ) -> Result<usize, EngineError> {
+        let picker = BatchClient {
+            bus,
+            sink,
+            groups: self.batch_groups(),
+        };
+        loop {
+            if let Some(s) = picker.try_pick(prompt) {
+                return Ok(s);
+            }
+            if cancel.load(Ordering::Relaxed) {
+                return Err(EngineError::Cancelled);
+            }
+            bus.wait_slot(crate::batch::CLAIM_WAIT);
+        }
     }
 
     /// A request failed with `EngineDied`: the engine usually just exited, but its stdout closes a moment before it
@@ -4487,6 +4587,11 @@ impl Engine for StdioSubprocessEngine {
             bus = handle.bus.clone();
             sink = StdinSink(handle.stdin.clone());
         }
+        let use_slot_prefill =
+            self.slot_prefill() && req.embeddings.is_none() && req.sampling.json_schema.is_none();
+        if use_slot_prefill {
+            drop(slot.take());
+        }
         // serve/server.py's hand-overs. A request that finds the engine to itself
         // (every slot free, nobody waiting) takes the solo path - the fastest stream, no
         // batch window to pay for - and an arrival's very queueing evicts it into a slot
@@ -4514,7 +4619,8 @@ impl Engine for StdioSubprocessEngine {
         };
         loop {
             let left = req.max_new_tokens.saturating_sub(emitted_total);
-            if self.parallel_solo.load(Ordering::Relaxed)
+            if slot.is_some()
+                && self.parallel_solo.load(Ordering::Relaxed)
                 && left > 1
                 && slot_hint.is_none()
                 && bus.slots_idle()
@@ -4641,43 +4747,86 @@ impl Engine for StdioSubprocessEngine {
             // A leg's own budget: the engine stops a slot at its line's `max_new`, so each
             // admission gets what the earlier legs left (serve/server.py's `left`).
             let max_new = req.max_new_tokens.saturating_sub(emitted_total);
-            let mut res = self.admit_slot(
-                &bus,
-                &sink,
-                req,
-                &prompt,
-                max_new,
-                slot_hint.take(),
-                &mut || self.reserve_slot(&bus, &sink, &prompt, &cancel, &mut slot),
-                Some(&|| self.admit_yields_to(req, prompt.len(), yields)),
-                &cancel,
-                on_token,
-                on_progress,
-            );
-            if never_reached_engine(res.as_ref().err()) {
-                let handle = self.running(slot.as_mut().unwrap())?;
-                bus = handle.bus.clone();
-                sink = StdinSink(handle.stdin.clone());
-                res = self.admit_slot(
+            let leg = if slot.is_none() {
+                let mut res = self.admit_slot_prefill(
                     &bus,
                     &sink,
                     req,
                     &prompt,
                     max_new,
-                    None,
+                    &cancel,
+                    on_token,
+                    on_progress,
+                );
+                if never_reached_engine(res.as_ref().err()) {
+                    let mut guard = self.lock_proc(&cancel)?;
+                    self.settle_after_error(&mut guard, res.as_ref().err());
+                    let handle = self.running(&mut guard)?;
+                    bus = handle.bus.clone();
+                    sink = StdinSink(handle.stdin.clone());
+                    drop(guard);
+                    res = self.admit_slot_prefill(
+                        &bus,
+                        &sink,
+                        req,
+                        &prompt,
+                        max_new,
+                        &cancel,
+                        on_token,
+                        on_progress,
+                    );
+                    let mut guard = self.proc.lock().unwrap();
+                    self.after_resend(&mut guard, res.as_ref().err());
+                }
+                match res {
+                    Ok(leg) => leg,
+                    Err(e) => {
+                        if matches!(e, EngineError::EngineDied(_)) {
+                            let mut guard = self.proc.lock().unwrap();
+                            self.settle_after_error(&mut guard, Some(&e));
+                        }
+                        return Err(e);
+                    }
+                }
+            } else {
+                let mut res = self.admit_slot(
+                    &bus,
+                    &sink,
+                    req,
+                    &prompt,
+                    max_new,
+                    slot_hint.take(),
                     &mut || self.reserve_slot(&bus, &sink, &prompt, &cancel, &mut slot),
                     Some(&|| self.admit_yields_to(req, prompt.len(), yields)),
                     &cancel,
                     on_token,
                     on_progress,
                 );
-                self.after_resend(slot.as_mut().unwrap(), res.as_ref().err());
-            }
-            let leg = match res {
-                Ok(leg) => leg,
-                Err(e) => {
-                    self.settle_after_error(slot.as_mut().unwrap(), Some(&e));
-                    return Err(e);
+                if never_reached_engine(res.as_ref().err()) {
+                    let handle = self.running(slot.as_mut().unwrap())?;
+                    bus = handle.bus.clone();
+                    sink = StdinSink(handle.stdin.clone());
+                    res = self.admit_slot(
+                        &bus,
+                        &sink,
+                        req,
+                        &prompt,
+                        max_new,
+                        None,
+                        &mut || self.reserve_slot(&bus, &sink, &prompt, &cancel, &mut slot),
+                        Some(&|| self.admit_yields_to(req, prompt.len(), yields)),
+                        &cancel,
+                        on_token,
+                        on_progress,
+                    );
+                    self.after_resend(slot.as_mut().unwrap(), res.as_ref().err());
+                }
+                match res {
+                    Ok(leg) => leg,
+                    Err(e) => {
+                        self.settle_after_error(slot.as_mut().unwrap(), Some(&e));
+                        return Err(e);
+                    }
                 }
             };
             if let Some(read) = leg.yielded {

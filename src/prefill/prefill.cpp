@@ -1073,6 +1073,14 @@ void Prefill::reset() {
     stats_ = PrefillStats{};
 }
 
+void Prefill::set_session(core::SessionState* s) {
+    if (impl_ && s != nullptr) impl_->ss = s;
+}
+
+bool Prefill::borrowed() const {
+    return impl_ && impl_->borrowed;
+}
+
 void Prefill::release() {
     if (!impl_) return;
     if (impl_->cs) cudaStreamSynchronize(impl_->cs);

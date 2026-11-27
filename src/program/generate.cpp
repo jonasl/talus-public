@@ -9016,7 +9016,9 @@ static int qwen4exp_engine_main(int argc, char** argv) {
         // come from Q8_1 x Q8_0 MMQ rather than mmvq: drafts may differ, the target's tokens never.
         static const bool split_mtp_batch = strata::program::draft_kv::split_env_on(std::getenv("STRATA_SPLIT_MTP_BATCH"));
         std::function<bool(int64_t done, std::string& e)> batch_chunk_hook;
+        std::function<bool(const float* R_rows, int64_t T, int64_t p0, std::string& e)> slot_on_chunk_hook;
         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+            if (slot_on_chunk_hook) return slot_on_chunk_hook(R_rows, T, p0, e);
             std::vector<int32_t> nxt((size_t) T);
             for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
             // E-9: batched through the prompt path when it can (a layer split: only with STRATA_SPLIT_MTP_BATCH=1)
@@ -10143,6 +10145,10 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                     slots_all += remote_experts[(size_t) r].resident();
                     mib_all += (int64_t) (remote_experts[(size_t) r].gib() * 1024.0);
                 }
+            const bool slot_borrows_cache = !pf_parts.empty() && pf_parts[0].first >= 0;
+            const bool slot_prefill_on = o.batch > 0 && o.prefill_chunk > 0 && stages.empty() &&
+                                         !o.prefill_head_alias && !kvg.on && !remote_opt && !peer.valid() &&
+                                         !slot_borrows_cache;
             std::printf("INFO logit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
@@ -10163,7 +10169,8 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                         (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
-                                       " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "");
+                                       " batch_groups=" + std::to_string(o.batch_groups) +
+                                       " slot_prefill=" + std::to_string(slot_prefill_on ? 1 : 0)).c_str() : "");
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
@@ -10398,8 +10405,29 @@ static int qwen4exp_engine_main(int argc, char** argv) {
             // #879: it was running when non-finite logits dropped the cached state; its state may have started from
             // that state (a checkpoint, a parked conversation), so it is not kept as a cache when it ends
             bool tainted = false;
+            // slot_prefill=1: in-place slot-resident prompt prefill (BPREFILL)
+            bool prefilling = false;
+            bool pf_ignore_eos = false, pf_req_cache = true, pf_req_ckpt = true, pf_want_cvec = true;
+            int64_t pf_req_pin = 0, pf_req_short_read = 0, pf_max_new = 0;
+            int64_t pf_n = 0, pf_resume = 0, pf_read_from = 0, pf_read_at = 0, pf_reached = 0;
+            int64_t pf_turn_at = -1, pf_root_at = -1, pf_message_at = -1, pf_pin_at = -1, pf_next_check = INT64_MAX;
+            int64_t pf_tail_ckpt_len = -1;
+            bool pf_tail_saved = false;
+            std::vector<int64_t> pf_cuts;
+            size_t pf_cut_idx = 0;
+            std::vector<int64_t> pf_ids;
+            std::vector<int32_t> pf_live;
+            strata::kernels::SamplerParams pf_sp{};
+            Clock::time_point pf_t0{}, pf_chunk_t0{};
+            double pf_ms = 0.0;
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
+        static const double default_decode_share = [] {
+            const char* v = std::getenv("STRATA_BATCH_DECODE_SHARE");
+            return v != nullptr ? std::max(0.0, std::atof(v)) : 0.5;
+        }();
+        double session_decode_share = default_decode_share;
+        auto any_prefilling = [&] { for (const BSlot& b : bs) if (b.prefilling) return true; return false; };
         // timing of the batch windows since the slots were last all idle (one stderr line then)
         double bt_run = 0, bt_commit = 0, bt_emit = 0;
         double bt_wait0 = 0, bt_pool0 = 0;
@@ -10507,6 +10535,96 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                 mtp.set_prompt_len(upto);
             }
             return true;
+        };
+        auto copy_slot_to_slot = [&](int src_b, int dst_b, const std::vector<int32_t>& slot_ids, std::string& e) -> bool {
+            const int64_t upto = (int64_t) slot_ids.size();
+            for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                strata::core::SessionState& from = *bslot_ss[k][(size_t) src_b];
+                strata::core::SessionState& to = *bslot_ss[k][(size_t) dst_b];
+                const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
+                if (cudaDeviceSynchronize() != cudaSuccess) { e = "slot copy: device sync failed"; return false; }
+                if (!strata::core::conversation_session_copy(from, to, g, slot_ids, e)) return false;
+                for (int64_t j = 0; j < from.qsa_alloc; ++j) {
+                    if (!strata::core::conversation_kv_copy(from.qsa_states[from.qsa_ord0 + j],
+                                                            to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
+                        return false;
+                }
+                if (!strata::core::conversation_copy_sync(e)) return false;
+            }
+            if (batch_mtp) {
+                const strata::core::OnDevice on_mtp(mtp.device());
+                if (!slot_mtp[(size_t) src_b]->idle(e) || !slot_mtp[(size_t) dst_b]->idle(e) ||
+                    !strata::core::conversation_kv_copy(slot_mtp[(size_t) src_b]->kv_state(),
+                                                        slot_mtp[(size_t) dst_b]->kv_state(),
+                                                        draft_geometry, upto, false, e) ||
+                    !strata::core::conversation_copy_sync(e))
+                    return false;
+                slot_mtp[(size_t) dst_b]->set_prompt_len(upto);
+            }
+            return true;
+        };
+        auto checkpoint_slot_at = [&](int b, int64_t L, bool as_tail) -> bool {
+            if (o.prompt_cache <= 0 || L < 1) return true;
+            BSlot& sl = bs[(size_t) b];
+            for (ConvCheckpoint& c : sl.checks) {
+                if ((int64_t) c.ids.size() == L) {
+                    c.used = ++check_clock;
+                    if (!as_tail && L == sl.pf_tail_ckpt_len) sl.pf_tail_ckpt_len = -1;
+                    return true;
+                }
+            }
+            ConvCheckpoint c;
+            c.ids.assign(sl.pf_ids.begin(), sl.pf_ids.begin() + L);
+            if (!gpu_sync_ok() || !checkpoint_save(c, *bslot_ss[0][(size_t) b], g)) return false;
+            c.used = ++check_clock;
+            if (as_tail) {
+                const int64_t old_tail = sl.pf_tail_ckpt_len;
+                sl.checks.erase(std::remove_if(sl.checks.begin(), sl.checks.end(), [&](const ConvCheckpoint& k) {
+                                    return old_tail >= 0 && (int64_t) k.ids.size() == old_tail;
+                                }), sl.checks.end());
+                sl.pf_tail_ckpt_len = L;
+            } else if (L == sl.pf_tail_ckpt_len) {
+                sl.pf_tail_ckpt_len = -1;
+            }
+            sl.checks.push_back(std::move(c));
+            while ((int) sl.checks.size() > o.prompt_cache) {
+                std::vector<uint64_t> stamps;
+                std::vector<char> is_tail;
+                stamps.reserve(sl.checks.size());
+                for (const ConvCheckpoint& k : sl.checks) {
+                    stamps.push_back(k.used);
+                    is_tail.push_back(sl.pf_tail_ckpt_len >= 0 && (int64_t) k.ids.size() == sl.pf_tail_ckpt_len);
+                }
+                std::unique_ptr<bool[]> tail_flags(new bool[is_tail.size()]);
+                for (size_t i = 0; i < is_tail.size(); ++i) tail_flags[i] = is_tail[i] != 0;
+                const size_t victim = strata::program::conv_cache::eviction_victim(
+                    stamps.data(), stamps.size(), o.prompt_cache, tail_flags.get(), nullptr);
+                sl.checks.erase(sl.checks.begin() + (std::ptrdiff_t) victim);
+            }
+            return true;
+        };
+        auto park_slot_cached = [&](int b, size_t held) {
+            BSlot& sl = bs[(size_t) b];
+            if (!conversations.enabled() || !sl.cached || sl.img || sl.ids.empty() ||
+                !conversations.wants((int64_t) sl.ids.size()))
+                return;
+            try {
+                std::vector<ImgKey> no_imgs;
+                const strata::core::QsaState* draft0 = batch_mtp ? &slot_mtp[(size_t) b]->kv_state() : nullptr;
+                const strata::core::ConversationView view{sl.ids, no_imgs, sl.checks, sl.cvec};
+                size_t estimate = 0;
+                std::string pe;
+                if (!strata::core::conversation_snapshot_bytes(view, *bslot_ss[0][(size_t) b], g, draft0, estimate, pe))
+                    return;
+                const size_t avail_bytes = conversations.make_room(estimate, held);
+                if (avail_bytes < estimate) return;
+                strata::core::SavedConversation saved;
+                if (strata::core::conversation_snapshot_save(saved, view, *bslot_ss[0][(size_t) b], g, draft0, pe)) {
+                    saved.cvec = sl.cvec;
+                    conversations.put(std::move(saved), false);
+                }
+            } catch (const std::bad_alloc&) {
+            }
         };
         auto stage_verifier = [&](int k) -> strata::core::Verifier& { return k == 0 ? ver : stages[(size_t) k - 1]->ver; };
         // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
@@ -12463,10 +12581,709 @@ static int qwen4exp_engine_main(int argc, char** argv) {
             // ---- qwen4exp-p4 end
             return g_qwen4exp_rust_driver->run_serve_loop(g_qwen4exp_rust_driver->user_data, &serve_ctx);
         }
+        const bool slot_borrows_cache = !pf_parts.empty() && pf_parts[0].first >= 0;
+        const bool slot_prefill_enabled = o.batch > 0 && o.prefill_chunk > 0 && stages.empty() && !piped &&
+                                          !o.prefill_head_alias && !kvg.on && !remote_opt && !peer.valid() &&
+                                          !slot_borrows_cache;
+        auto cancel_slot_prefill = [&](int b, const char* reason) {
+            BSlot& sl = bs[(size_t) b];
+            if (!sl.prefilling) return;
+            const int64_t fresh = std::max<int64_t>(0, sl.pf_n - sl.pf_resume);
+            const int64_t read_n = std::clamp<int64_t>(sl.pf_reached - sl.pf_resume, 0, fresh);
+            std::printf("BPDONE %d %lld %.1f 0.0 %s %lld %lld\n", b, (long long) sl.pf_n, sl.pf_ms,
+                        reason, (long long) sl.pf_resume, (long long) read_n);
+            std::printf("BPADMIT %d 0\n", b);
+            std::fflush(stdout);
+            sl.prefilling = false;
+            sl.cached = false;
+            sl.partial = false;
+            sl.checks.clear();
+            sl.pf_ids.clear();
+            sl.pf_live.clear();
+            sl.pf_cuts.clear();
+        };
+        auto start_slot_prefill = [&](const std::string& cmd_line) -> bool {
+            char* e1 = nullptr;
+            const long slot_l = std::strtol(cmd_line.c_str() + 9, &e1, 10);
+            char* e2 = nullptr;
+            const long long mn = std::strtoll(e1, &e2, 10);
+            if (!slot_prefill_enabled || slot_l < 0 || slot_l >= (long) bs.size() || mn < 1 || e2 == e1) {
+                std::printf("ERR BPREFILL: invalid slot or max_new\n");
+                std::fflush(stdout);
+                return false;
+            }
+            const int slot = (int) slot_l;
+            if (bs[(size_t) slot].active || bs[(size_t) slot].prefilling) {
+                std::printf("BPERR %d slot %d is busy\n", slot, slot);
+                std::fflush(stdout);
+                return false;
+            }
+            float req_temperature = 0.0f, req_top_p = 1.0f;
+            int req_top_k = 20;
+            unsigned long long req_seed = 0;
+            float req_min_p = 0.0f, req_penalty_repeat = 1.0f, req_penalty_freq = 0.0f, req_penalty_present = 0.0f;
+            int req_penalty_last_n = 0;
+            int req_cvec = 1, req_ckpt = 1;
+            int64_t req_pin = 0, req_short_read = o.short_read;
+            bool req_ignore_eos = false, req_cache = true;
+            char* endp = e2;
+            for (;;) {
+                while (*endp == ' ') ++endp;
+                const char* start = endp;
+                while (*endp != '\0' && *endp != ' ') ++endp;
+                if (endp == start) break;
+                const std::string tok(start, (size_t) (endp - start));
+                const size_t eq = tok.find('=');
+                if (eq == std::string::npos) { endp = const_cast<char*>(start); break; }
+                const std::string key = tok.substr(0, eq);
+                const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
+                if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
+                else if (key == "ckpt") req_ckpt = std::atoi(tok.c_str() + eq + 1) != 0;
+                else if (key == "ignore_eos") req_ignore_eos = std::atoi(tok.c_str() + eq + 1) != 0;
+                else if (key == "cache") req_cache = std::atoi(tok.c_str() + eq + 1) != 0;
+                else if (key == "pin") req_pin = std::max<long long>(0, std::atoll(tok.c_str() + eq + 1));
+                else if (key == "short_read") req_short_read = std::max<long long>(0, std::atoll(tok.c_str() + eq + 1));
+                else if (key == "temperature") req_temperature = fv;
+                else if (key == "top_p") req_top_p = fv;
+                else if (key == "top_k") req_top_k = std::atoi(tok.c_str() + eq + 1);
+                else if (key == "min_p") req_min_p = fv;
+                else if (key == "penalty_last_n") req_penalty_last_n = std::atoi(tok.c_str() + eq + 1);
+                else if (key == "penalty_repeat") req_penalty_repeat = fv;
+                else if (key == "penalty_freq") req_penalty_freq = fv;
+                else if (key == "penalty_present") req_penalty_present = fv;
+                else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
+                else if (key == "decode_share") session_decode_share = std::max(0.0, (double) fv);
+                else if (key == "logit_bias") {
+                    std::printf("BPERR %d logit_bias is not supported with continuous batching\n", slot);
+                    std::fflush(stdout);
+                    return false;
+                }
+            }
+            std::vector<int64_t> ids;
+            std::string pe;
+            if (!parse_i64_list(endp, ids, pe)) {
+                std::printf("BPERR %d bad request: %s\n", slot, pe.c_str());
+                std::fflush(stdout);
+                return false;
+            }
+            const int64_t n = (int64_t) ids.size();
+            if (n < 1 || n + mn + 8 > o.max_context) {
+                std::printf("BPERR %d prompt (%lld tokens) + max_new (%lld) exceeds max_context (%lld)\n",
+                            slot, (long long) n, (long long) mn, (long long) o.max_context);
+                std::fflush(stdout);
+                return false;
+            }
+            for (int64_t t : ids) {
+                if (t < 0 || t >= n_vocab) {
+                    std::printf("BPERR %d a token id is outside the vocabulary\n", slot);
+                    std::fflush(stdout);
+                    return false;
+                }
+            }
+            if (!mrope_identity) {
+                const int64_t cells = (int64_t) mrope_host.size() / 3;
+                for (int64_t c = 0; c < cells; ++c) {
+                    mrope_host[(size_t) c * 3] = (int32_t) c;
+                    mrope_host[(size_t) c * 3 + 1] = (int32_t) c;
+                    mrope_host[(size_t) c * 3 + 2] = (int32_t) c;
+                }
+                cudaDeviceSynchronize();
+                if (cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
+                               cudaMemcpyHostToDevice) != cudaSuccess) {
+                    std::printf("BPERR %d resetting mrope identity failed\n", slot);
+                    std::fflush(stdout);
+                    return false;
+                }
+                mrope_identity = true;
+            }
+            if (nan_flush) {
+                nan_flush = false;
+                live_ok = false;
+                checks.clear();
+                tail_ckpt_len = -1;
+                conversations.clear();
+                for (BSlot& sl : bs) {
+                    if (sl.active || sl.prefilling) sl.tainted = true;
+                    else if (sl.cached) { sl.cached = false; sl.partial = false; sl.checks.clear(); }
+                }
+            }
+            const bool want_cvec = strata::kernels::cvec().loaded() ? req_cvec != 0 : true;
+            auto starts_with_ids = [&](const std::vector<int32_t>& pre) -> bool {
+                const int64_t L = (int64_t) pre.size();
+                if (L < 1 || L > n - 1) return false;
+                for (int64_t i = 0; i < L; ++i)
+                    if ((int32_t) ids[(size_t) i] != pre[(size_t) i]) return false;
+                return true;
+            };
+
+            // Choose best prefix source across: (1) this slot itself (0-copy!), (2) other idle cached slots,
+            // (3) main live/checks on `ss`, (4) parked conversations.
+            int64_t resume = 0;
+            int source_kind = 0;  // 0=zero, 1=self_live, 2=self_ckpt, 3=other_slot, 4=ss_live, 5=ss_ckpt, 6=parked
+            int source_slot = -1;
+            const ConvCheckpoint* source_ck = nullptr;
+            if (o.prompt_cache > 0 && req_cache) {
+                const BSlot& self_sl = bs[(size_t) slot];
+                if (self_sl.cached && !self_sl.img && self_sl.cvec == want_cvec) {
+                    if ((int64_t) self_sl.ids.size() > resume && starts_with_ids(self_sl.ids)) {
+                        resume = (int64_t) self_sl.ids.size();
+                        source_kind = 1;
+                    }
+                    for (const ConvCheckpoint& c : self_sl.checks)
+                        if ((int64_t) c.ids.size() > resume && c.imgs.empty() && starts_with_ids(c.ids)) {
+                            resume = (int64_t) c.ids.size();
+                            source_kind = 2;
+                            source_ck = &c;
+                        }
+                }
+                for (int b = 0; b < (int) bs.size(); ++b) {
+                    if (b == slot) continue;
+                    const BSlot& sl = bs[(size_t) b];
+                    if (sl.active || sl.prefilling || !sl.cached || sl.img || sl.cvec != want_cvec) continue;
+                    if ((int64_t) sl.ids.size() > resume && starts_with_ids(sl.ids)) {
+                        resume = (int64_t) sl.ids.size();
+                        source_kind = 3;
+                        source_slot = b;
+                        source_ck = nullptr;
+                    }
+                    for (const ConvCheckpoint& c : sl.checks)
+                        if ((int64_t) c.ids.size() > resume && c.imgs.empty() && starts_with_ids(c.ids)) {
+                            resume = (int64_t) c.ids.size();
+                            source_kind = 3;
+                            source_slot = b;
+                            source_ck = &c;
+                        }
+                }
+                if (want_cvec == cvec_cached) {
+                    if (live_ok && live_imgs.empty() && (int64_t) live.size() > resume && starts_with_ids(live)) {
+                        resume = (int64_t) live.size();
+                        source_kind = 4;
+                    }
+                    for (const ConvCheckpoint& c : checks)
+                        if ((int64_t) c.ids.size() > resume && c.imgs.empty() && starts_with_ids(c.ids)) {
+                            resume = (int64_t) c.ids.size();
+                            source_kind = 5;
+                            source_ck = &c;
+                        }
+                }
+            }
+            const auto parked = req_cache ? conversations.best(ids, {}, want_cvec) : decltype(conversations.best(ids, {}, want_cvec)){};
+            std::optional<strata::core::SavedConversation> incoming;
+            if (req_cache && parked.tokens > resume) {
+                incoming.emplace(conversations.take(parked.index));
+                if (!strata::core::conversation_snapshot_validate(*incoming, *bslot_ss[0][(size_t) slot], g,
+                        batch_mtp ? &slot_mtp[(size_t) slot]->kv_state() : nullptr, err)) {
+                    err.clear();
+                    incoming.reset();
+                } else {
+                    resume = parked.tokens;
+                    source_kind = 6;
+                }
+            }
+
+            if (source_kind != 1 && source_kind != 2) {
+                park_slot_cached(slot, incoming ? incoming->bytes() : 0);
+            }
+
+            BSlot new_sl{};
+            if (source_kind == 1) {
+                new_sl.checks = std::move(bs[(size_t) slot].checks);
+                new_sl.pf_tail_ckpt_len = bs[(size_t) slot].pf_tail_ckpt_len;
+                if (batch_mtp) {
+                    if (resume > 0) slot_mtp[(size_t) slot]->kv_restore(resume);
+                    slot_mtp[(size_t) slot]->set_prompt_len(n);
+                }
+            } else if (source_kind == 2 && source_ck != nullptr) {
+                ConvCheckpoint ck_copy = *source_ck;
+                if (cudaDeviceSynchronize() != cudaSuccess || !checkpoint_restore(ck_copy, *bslot_ss[0][(size_t) slot], g)) {
+                    resume = 0; source_kind = 0;
+                } else {
+                    if (batch_mtp) slot_mtp[(size_t) slot]->kv_restore(resume);
+                    if (batch_mtp) slot_mtp[(size_t) slot]->set_prompt_len(n);
+                    new_sl.checks = std::move(bs[(size_t) slot].checks);
+                    new_sl.pf_tail_ckpt_len = bs[(size_t) slot].pf_tail_ckpt_len;
+                }
+            } else if (source_kind == 3 && source_slot >= 0) {
+                std::vector<int32_t> copy_ids = source_ck ? source_ck->ids : bs[(size_t) source_slot].ids;
+                if (source_ck != nullptr) {
+                    ConvCheckpoint ck_copy = *source_ck;
+                    std::string ce;
+                    if (cudaDeviceSynchronize() != cudaSuccess ||
+                        !checkpoint_restore(ck_copy, *bslot_ss[0][(size_t) slot], g) ||
+                        [&] {
+                            for (int64_t j = 0; j < bslot_ss[0][(size_t) source_slot]->qsa_alloc; ++j)
+                                if (!strata::core::conversation_kv_copy(
+                                        bslot_ss[0][(size_t) source_slot]->qsa_states[bslot_ss[0][(size_t) source_slot]->qsa_ord0 + j],
+                                        bslot_ss[0][(size_t) slot]->qsa_states[bslot_ss[0][(size_t) slot]->qsa_ord0 + j],
+                                        g, resume, true, ce))
+                                    return true;
+                            return !strata::core::conversation_copy_sync(ce);
+                        }()) {
+                        resume = 0; source_kind = 0;
+                    } else {
+                        if (batch_mtp) {
+                            const strata::core::OnDevice on_mtp(mtp.device());
+                            if (!slot_mtp[(size_t) source_slot]->idle(ce) || !slot_mtp[(size_t) slot]->idle(ce) ||
+                                !strata::core::conversation_kv_copy(slot_mtp[(size_t) source_slot]->kv_state(),
+                                                                    slot_mtp[(size_t) slot]->kv_state(),
+                                                                    draft_geometry, resume, false, ce) ||
+                                !strata::core::conversation_copy_sync(ce)) {
+                                resume = 0; source_kind = 0;
+                            } else {
+                                slot_mtp[(size_t) slot]->kv_restore(resume);
+                                slot_mtp[(size_t) slot]->set_prompt_len(n);
+                            }
+                        }
+                        if (source_kind == 3) new_sl.checks.push_back(*source_ck);
+                    }
+                } else {
+                    std::string ce;
+                    if (!copy_slot_to_slot(source_slot, slot, copy_ids, ce)) {
+                        resume = 0; source_kind = 0;
+                    } else {
+                        if (batch_mtp) slot_mtp[(size_t) slot]->set_prompt_len(n);
+                        new_sl.checks = bs[(size_t) source_slot].checks;
+                    }
+                }
+            } else if (source_kind == 4) {
+                std::string ce;
+                if (!copy_to_slot(slot, live, ce)) {
+                    resume = 0; source_kind = 0;
+                } else {
+                    if (batch_mtp) slot_mtp[(size_t) slot]->set_prompt_len(n);
+                    new_sl.checks = checks;
+                }
+            } else if (source_kind == 5 && source_ck != nullptr) {
+                ConvCheckpoint ck_copy = *source_ck;
+                std::string ce;
+                if (cudaDeviceSynchronize() != cudaSuccess ||
+                    !checkpoint_restore(ck_copy, *bslot_ss[0][(size_t) slot], g) ||
+                    [&] {
+                        for (int64_t j = 0; j < ss.qsa_alloc; ++j)
+                            if (!strata::core::conversation_kv_copy(
+                                    ss.qsa_states[ss.qsa_ord0 + j],
+                                    bslot_ss[0][(size_t) slot]->qsa_states[bslot_ss[0][(size_t) slot]->qsa_ord0 + j],
+                                    g, resume, true, ce))
+                                return true;
+                        return !strata::core::conversation_copy_sync(ce);
+                    }()) {
+                    resume = 0; source_kind = 0;
+                } else {
+                    if (batch_mtp) {
+                        const strata::core::OnDevice on_mtp(mtp.device());
+                        if (!mtp.idle(ce) || !slot_mtp[(size_t) slot]->idle(ce) ||
+                            !strata::core::conversation_kv_copy(mtp.kv_state(), slot_mtp[(size_t) slot]->kv_state(),
+                                                                draft_geometry, resume, false, ce) ||
+                            !strata::core::conversation_copy_sync(ce)) {
+                            resume = 0; source_kind = 0;
+                        } else {
+                            slot_mtp[(size_t) slot]->kv_restore(resume);
+                            slot_mtp[(size_t) slot]->set_prompt_len(n);
+                        }
+                    }
+                    if (source_kind == 5) new_sl.checks.push_back(*source_ck);
+                }
+            } else if (source_kind == 6 && incoming) {
+                std::string re;
+                if (strata::core::conversation_snapshot_restore(*incoming, *bslot_ss[0][(size_t) slot], g,
+                        batch_mtp ? &slot_mtp[(size_t) slot]->kv_state() : nullptr, re) !=
+                    strata::core::ConversationRestore::restored) {
+                    resume = 0; source_kind = 0;
+                } else {
+                    new_sl.checks = std::move(incoming->checkpoints);
+                    if (batch_mtp) {
+                        slot_mtp[(size_t) slot]->kv_restore(resume);
+                        slot_mtp[(size_t) slot]->set_prompt_len(n);
+                    }
+                }
+            }
+            if (source_kind == 0) {
+                resume = 0;
+                new_sl.checks.clear();
+                strata::core::session_zero(*bslot_ss[0][(size_t) slot], g, nullptr, main_cs);
+                cudaStreamSynchronize(main_stream);
+                if (batch_mtp) slot_mtp[(size_t) slot]->set_prompt_len(n);
+            }
+
+            new_sl.checks.erase(std::remove_if(new_sl.checks.begin(), new_sl.checks.end(), [&](const ConvCheckpoint& c) {
+                return (int64_t) c.ids.size() > resume || !starts_with_ids(c.ids);
+            }), new_sl.checks.end());
+
+            new_sl.prefilling = true;
+            new_sl.cvec = want_cvec;
+            new_sl.pf_ignore_eos = req_ignore_eos;
+            new_sl.pf_req_cache = req_cache;
+            new_sl.pf_req_ckpt = req_ckpt;
+            new_sl.pf_want_cvec = want_cvec;
+            new_sl.pf_req_pin = req_pin;
+            new_sl.pf_req_short_read = req_short_read;
+            new_sl.pf_max_new = mn;
+            new_sl.pf_n = n;
+            new_sl.pf_resume = resume;
+            new_sl.pf_read_from = resume;
+            new_sl.pf_read_at = resume;
+            new_sl.pf_reached = resume;
+            new_sl.pf_next_check = !req_ckpt ? INT64_MAX : resume + o.prompt_cache_every;
+            new_sl.pf_tail_saved = !req_ckpt;
+            new_sl.pf_ids = std::move(ids);
+            new_sl.pf_live.reserve((size_t) n);
+            for (int64_t i = 0; i < n - 1; ++i) new_sl.pf_live.push_back((int32_t) new_sl.pf_ids[(size_t) i]);
+            new_sl.pf_sp.greedy = req_temperature <= 0.0f;
+            new_sl.pf_sp.temperature = req_temperature;
+            new_sl.pf_sp.top_p = req_top_p;
+            new_sl.pf_sp.top_k = req_top_k;
+            new_sl.pf_sp.seed = req_seed ? req_seed
+                                         : (unsigned long long) std::chrono::steady_clock::now().time_since_epoch().count();
+            new_sl.pf_sp.min_p = std::clamp(req_min_p, 0.0f, 1.0f);
+            new_sl.pf_sp.penalty_last_n = std::max(req_penalty_last_n, 0);
+            new_sl.pf_sp.penalty_repeat = req_penalty_repeat;
+            new_sl.pf_sp.penalty_freq = req_penalty_freq;
+            new_sl.pf_sp.penalty_present = req_penalty_present;
+            new_sl.pf_sp.counter = 0;
+            new_sl.pf_t0 = Clock::now();
+            new_sl.pf_ms = 0.0;
+
+            if (req_pin > 0 && req_ckpt && o.prompt_cache >= 3 && req_pin < n - 1 && req_pin > resume) {
+                new_sl.pf_pin_at = req_pin;
+            }
+            static const bool message_checkpoint = [] {
+                const char* e = std::getenv("STRATA_CACHE_MESSAGE_BOUNDARY");
+                return e != nullptr && std::atoi(e) != 0;
+            }();
+            int64_t rust_cuts[6] = {};
+            size_t rust_n_cuts = 0;
+            if (g_qwen4exp_rust_driver != nullptr && g_qwen4exp_rust_driver->plan_prompt_cuts != nullptr &&
+                g_qwen4exp_rust_driver->plan_prompt_cuts(
+                    g_qwen4exp_rust_driver->user_data,
+                    new_sl.pf_ids.data(),
+                    new_sl.pf_ids.size(),
+                    resume,
+                    resume,
+                    0,
+                    0,
+                    o.prompt_cache,
+                    o.turn_token,
+                    o.tail_role_token,
+                    o.prompt_cache_root,
+                    req_ckpt ? 1 : 0,
+                    0,
+                    message_checkpoint ? 1 : 0,
+                    new_sl.pf_pin_at,
+                    &new_sl.pf_turn_at,
+                    &new_sl.pf_root_at,
+                    &new_sl.pf_message_at,
+                    rust_cuts,
+                    &rust_n_cuts) != 0) {
+                new_sl.pf_cuts.assign(rust_cuts, rust_cuts + rust_n_cuts);
+            } else {
+                if (o.prompt_cache > 0 && o.turn_token >= 0)
+                    for (int64_t i = n - 1; i > resume; --i)
+                        if (new_sl.pf_ids[(size_t) i] == o.turn_token) { new_sl.pf_turn_at = i; break; }
+                if (new_sl.pf_turn_at > 0 && o.tail_role_token >= 0)
+                    for (int64_t i = new_sl.pf_turn_at - 1; i > resume; --i)
+                        if (new_sl.pf_ids[(size_t) i] == o.turn_token) {
+                            if (new_sl.pf_ids[(size_t) i + 1] == o.tail_role_token) new_sl.pf_turn_at = i;
+                            break;
+                        }
+                const int64_t last_turn = new_sl.pf_turn_at;
+                if (!req_ckpt) new_sl.pf_turn_at = -1;
+                if (o.prompt_cache > 0 && o.turn_token >= 0 && o.prompt_cache_root > 0 && resume == 0)
+                    for (int64_t i = 1; i < last_turn; ++i)
+                        if (new_sl.pf_ids[(size_t) i] == o.turn_token) {
+                            if (i >= o.prompt_cache_root) new_sl.pf_root_at = i;
+                            break;
+                        }
+                new_sl.pf_message_at = message_checkpoint && o.prompt_cache > 0
+                    ? strata::program::message_checkpoint_boundary(new_sl.pf_ids, resume, new_sl.pf_turn_at, o.turn_token) : -1;
+                new_sl.pf_cuts = {new_sl.pf_root_at, new_sl.pf_message_at, new_sl.pf_turn_at, n - 1};
+                if (new_sl.pf_pin_at >= 0) {
+                    new_sl.pf_cuts.push_back(new_sl.pf_pin_at);
+                    std::sort(new_sl.pf_cuts.begin(), new_sl.pf_cuts.end());
+                }
+            }
+
+            bs[(size_t) slot] = std::move(new_sl);
+            std::printf("BPRESUME %d %lld\n", slot, (long long) resume);
+            std::fflush(stdout);
+            return true;
+        };
+        auto finish_slot_prefill = [&](int p_slot) -> bool {
+            BSlot& sl = bs[(size_t) p_slot];
+            const Clock::time_point td0 = Clock::now();
+            const int64_t p = sl.pf_n - 1;
+            const int32_t x = (int32_t) sl.pf_ids[(size_t) p];
+            ver.set_slot_sampling(p_slot, sl.pf_sp);
+            ver.set_history(nullptr, 0);
+            drive.d.layers = 0;
+            drive.d.experts = 0;
+            drive.d.failed = false;
+            apply_pending(false);
+            int32_t out_tok = 0;
+            std::string verr;
+            if (!ver.run_slot_rows(&p_slot, 1, &x, &p, win_pool_fn, win_pool_user, &out_tok, verr) || drive.d.failed) {
+                if (drive.d.failed && drive.d.fail) verr = drive.d.fail;
+                std::printf("BPERR %d %s\n", p_slot, verr.c_str());
+                std::fflush(stdout);
+                sl.prefilling = false;
+                sl.cached = false;
+                return false;
+            }
+            if (ver.nonfinite_in(0)) {
+                nan_flush = true;
+                const int64_t fresh = std::max<int64_t>(0, sl.pf_n - sl.pf_resume);
+                std::printf("BPDONE %d %lld %.1f 0.0 nonfinite %lld %lld\n", p_slot, (long long) sl.pf_n, sl.pf_ms,
+                            (long long) sl.pf_resume, (long long) fresh);
+                std::printf("BPADMIT %d 0\n", p_slot);
+                std::fflush(stdout);
+                sl.prefilling = false;
+                sl.cached = false;
+                return true;
+            }
+            if (!ver.commit_slots(verr)) {
+                std::printf("BPERR %d %s\n", p_slot, verr.c_str());
+                std::fflush(stdout);
+                sl.prefilling = false;
+                sl.cached = false;
+                return false;
+            }
+            sl.pf_live.push_back(x);   // all pf_n prompt tokens now live in bslot_ss[0][p_slot]
+            const int64_t end_at = strata::program::prompt_end_checkpoint(
+                sl.pf_n, sl.pf_turn_at, sl.pf_root_at, sl.pf_message_at, sl.pf_pin_at,
+                o.prompt_cache, sl.pf_req_ckpt, sl.pf_req_short_read, sl.pf_resume);
+            if (end_at > 0 && !checkpoint_slot_at(p_slot, end_at, false)) {
+                std::printf("BPERR %d saving end checkpoint failed\n", p_slot);
+                std::fflush(stdout);
+                sl.prefilling = false;
+                sl.cached = false;
+                return false;
+            }
+            const double dec_ms = std::chrono::duration<double, std::milli>(Clock::now() - td0).count();
+            const bool eos = !sl.pf_ignore_eos &&
+                std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) out_tok) != o.eos_ids.end();
+            const bool cont = !eos && sl.pf_max_new > 1 && sl.pf_n + 1 <= o.max_context;
+            const char* fin = eos ? "stop" : "length";
+            const int64_t fresh = std::max<int64_t>(0, sl.pf_n - sl.pf_resume);
+            std::printf("BPT %d %d\n", p_slot, (int) out_tok);
+            std::printf("BPDONE %d %lld %.1f %.1f %s %lld %lld\n", p_slot, (long long) sl.pf_n, sl.pf_ms, dec_ms,
+                        fin, (long long) sl.pf_resume, (long long) fresh);
+            if (cont) {
+                if (batch_mtp) {
+                    std::string merr;
+                    if (!slot_mtp[(size_t) p_slot]->draft_first(1, ver.final_R_all(), out_tok, sl.pf_n - 1,
+                                                                 sl.draft.data(), merr)) {
+                        std::printf("BPERR %d MTP admission failed: %s\n", p_slot, merr.c_str());
+                        std::fflush(stdout);
+                        sl.prefilling = false;
+                        sl.cached = false;
+                        return false;
+                    }
+                    sl.draft_ready = true;
+                }
+                sl.prefilling = false;
+                sl.active = true;
+                sl.stop = false;
+                sl.x = out_tok;
+                sl.p = sl.pf_n;
+                sl.produced = 1;
+                sl.max_new = sl.pf_max_new;
+                sl.t0 = Clock::now();
+                sl.ids = std::move(sl.pf_live);
+                sl.cached = false;
+                sl.img = false;
+                sl.pf_ids.clear();
+                sl.pf_cuts.clear();
+                std::printf("BPADMIT %d 1\n", p_slot);
+            } else {
+                sl.prefilling = false;
+                sl.active = false;
+                sl.ids = std::move(sl.pf_live);
+                sl.cached = o.prompt_cache > 0 && !sl.tainted;
+                sl.img = false;
+                sl.pf_ids.clear();
+                sl.pf_cuts.clear();
+                std::printf("BPADMIT %d 0\n", p_slot);
+            }
+            std::fflush(stdout);
+            return true;
+        };
+        auto step_slot_prefill = [&]() -> bool {
+            int p_slot = -1;
+            int64_t best_rem = INT64_MAX;
+            for (int b = 0; b < (int) bs.size(); ++b) {
+                const BSlot& sl = bs[(size_t) b];
+                if (!sl.prefilling) continue;
+                const int64_t rem = std::max<int64_t>(0, sl.pf_n - 1 - sl.pf_read_at);
+                if (rem < best_rem) {
+                    best_rem = rem;
+                    p_slot = b;
+                }
+            }
+            if (p_slot < 0) return true;
+            BSlot& sl = bs[(size_t) p_slot];
+            while (sl.pf_cut_idx < sl.pf_cuts.size() && sl.pf_cuts[sl.pf_cut_idx] <= sl.pf_read_at)
+                ++sl.pf_cut_idx;
+            if (sl.pf_read_at >= sl.pf_n - 1 || sl.pf_cut_idx >= sl.pf_cuts.size()) {
+                return finish_slot_prefill(p_slot);
+            }
+            const int64_t to = sl.pf_cuts[sl.pf_cut_idx];
+            sp.set_session(bslot_ss[0][(size_t) p_slot].get());
+            sp.embd_rows = nullptr;
+            if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(sl.pf_want_cvec);
+            drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
+
+            struct SlotHookGuard {
+                std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_ch;
+                std::function<bool(int64_t, std::string&)>& b_hook;
+                strata::prefill::Prefill& sp_ref;
+                strata::core::SessionState* orig_ss;
+                ~SlotHookGuard() { on_ch = nullptr; b_hook = nullptr; sp_ref.set_session(orig_ss); }
+            } sguard{slot_on_chunk_hook, batch_chunk_hook, sp, &ss};
+
+            sl.pf_chunk_t0 = Clock::now();
+            slot_on_chunk_hook = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+                std::vector<int32_t> nxt((size_t) T);
+                for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) sl.pf_ids[(size_t) (p0 + t + 1)];
+                bool batched = false;
+                if (batch_mtp) {
+                    const char* why = nullptr;
+                    batched = sp.draft_kv(*slot_mtp[(size_t) p_slot], R_rows, nxt.data(), T, p0, e, &why);
+                    if (!e.empty() || (!batched && !slot_mtp[(size_t) p_slot]->prefill(R_rows, nxt.data(), T, p0, e)))
+                        return false;
+                }
+                const int64_t done = p0 + T;
+                bslot_ss[0][(size_t) p_slot]->ple_prev[0] = done >= 2 ? (int32_t) sl.pf_ids[(size_t) (done - 2)] : -1;
+                bslot_ss[0][(size_t) p_slot]->ple_prev[1] = done >= 1 ? (int32_t) sl.pf_ids[(size_t) (done - 1)] : -1;
+                sl.pf_reached = done;
+                const double chunk_ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.pf_chunk_t0).count();
+                sl.pf_ms += chunk_ms;
+                const double tps = sl.pf_ms > 0.0 ? 1000.0 * (double) (done - sl.pf_resume) / sl.pf_ms : 0.0;
+                std::printf("BPP %d %lld %lld %.0f %.1f\n", p_slot, (long long) done, (long long) sl.pf_n, sl.pf_ms, tps);
+                std::fflush(stdout);
+                strata::core::progress_beat();
+                const bool periodic_ckpt = sl.pf_req_ckpt && o.prompt_cache_every > 0 && done >= sl.pf_next_check;
+                const bool tail_ckpt = sl.pf_req_ckpt && o.prompt_cache_tail && o.prompt_cache > 0 &&
+                    o.prompt_cache_every > 0 && sl.pf_n - done > std::max<int64_t>(1, sl.pf_req_short_read) &&
+                    sl.pf_n - done <= T && !sl.pf_tail_saved;
+                if (periodic_ckpt || tail_ckpt) {
+                    if (!checkpoint_slot_at(p_slot, done, tail_ckpt && !periodic_ckpt)) {
+                        e = "saving slot checkpoint failed";
+                        return false;
+                    }
+                    if (periodic_ckpt) sl.pf_next_check = done + o.prompt_cache_every;
+                    if (tail_ckpt) sl.pf_tail_saved = true;
+                }
+                if (batch_chunk_hook && !batch_chunk_hook(done, e)) return false;
+                return true;
+            };
+            bool preempted = false;
+            bool stopped = false;
+            batch_chunk_hook = [&](int64_t done, std::string& be) -> bool {
+                const double chunk_ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.pf_chunk_t0).count();
+                sl.pf_read_at = done;
+                std::string in_line;
+                while (try_next_line(in_line)) {
+                    if (in_line.rfind("BSTOP ", 0) == 0) {
+                        const int b = std::atoi(in_line.c_str() + 6);
+                        if (b >= 0 && b < (int) bs.size()) {
+                            if (b == p_slot) {
+                                stopped = true;
+                            } else if (bs[(size_t) b].prefilling) {
+                                cancel_slot_prefill(b, "cancel");
+                            } else {
+                                bs[(size_t) b].stop = true;
+                            }
+                        }
+                    } else if (in_line.rfind("BSHARE ", 0) == 0) {
+                        session_decode_share = std::max(0.0, std::atof(in_line.c_str() + 7));
+                    } else if (in_line.rfind("BPREFILL ", 0) == 0) {
+                        (void) start_slot_prefill(in_line);
+                    } else {
+                        std::lock_guard<std::mutex> lk(in_mu);
+                        in_lines.push_front(std::move(in_line));
+                        break;
+                    }
+                }
+                if (stopped) {
+                    be = "stop";
+                    return false;
+                }
+                const int64_t cur_rem = std::max<int64_t>(0, sl.pf_n - 1 - done);
+                for (int b = 0; b < (int) bs.size(); ++b) {
+                    if (b == p_slot || !bs[(size_t) b].prefilling) continue;
+                    const int64_t rem_b = std::max<int64_t>(0, bs[(size_t) b].pf_n - 1 - bs[(size_t) b].pf_read_at);
+                    if (rem_b < cur_rem) {
+                        preempted = true;
+                        be = "preempt";
+                        return false;
+                    }
+                }
+                if (done < to && session_decode_share > 0.0 && batch_on()) {
+                    const double budget = session_decode_share * chunk_ms;
+                    const auto td = Clock::now();
+                    in_prompt_read = true;
+                    do {
+                        if (!batch_step()) { in_prompt_read = false; be = "a batch window failed"; return false; }
+                    } while (batch_on() && std::chrono::duration<double, std::milli>(Clock::now() - td).count() < budget);
+                    in_prompt_read = false;
+                }
+                sl.pf_chunk_t0 = Clock::now();
+                return true;
+            };
+
+            std::string rerr;
+            const bool ok = sp.run(sl.pf_ids.data() + sl.pf_read_at, to - sl.pf_read_at, sl.pf_read_at, rerr);
+            if (!ok) {
+                if (stopped) {
+                    cancel_slot_prefill(p_slot, "cancel");
+                    return true;
+                }
+                if (preempted) {
+                    // Run one decode slice if batch_on() before switching to the shorter slot.
+                    if (session_decode_share > 0.0 && batch_on()) {
+                        in_prompt_read = true;
+                        const bool bok = batch_step();
+                        in_prompt_read = false;
+                        if (!bok) return false;
+                    }
+                    return true;
+                }
+                std::printf("BPERR %d %s\n", p_slot, rerr.c_str());
+                std::fflush(stdout);
+                sl.prefilling = false;
+                sl.cached = false;
+                return true;
+            }
+            sl.pf_read_at = to;
+            if ((to == sl.pf_turn_at || to == sl.pf_root_at || to == sl.pf_message_at || to == sl.pf_pin_at) &&
+                !checkpoint_slot_at(p_slot, to, to == sl.pf_message_at && to != sl.pf_turn_at && to != sl.pf_root_at && to != sl.pf_pin_at)) {
+                std::printf("BPERR %d saving cut checkpoint failed\n", p_slot);
+                std::fflush(stdout);
+                sl.prefilling = false;
+                sl.cached = false;
+                return true;
+            }
+            if (to == sl.pf_pin_at) {
+                for (ConvCheckpoint& c : sl.checks) c.pinned = ((int64_t) c.ids.size() == sl.pf_pin_at);
+            }
+            if (sl.pf_read_at >= sl.pf_n - 1) {
+                return finish_slot_prefill(p_slot);
+            }
+            if (session_decode_share > 0.0 && batch_on()) {
+                in_prompt_read = true;
+                const bool bok = batch_step();
+                in_prompt_read = false;
+                if (!bok) return false;
+            }
+            return true;
+        };
         for (;;) {
-            if (batch_on() || (piped && pipe_inflight())) {
+            if (any_prefilling() || batch_on() || (piped && pipe_inflight())) {
                 if (!try_next_line(line)) {
-                    if (!(piped ? pump(true) : batch_step())) return 1;
+                    if (any_prefilling()) {
+                        if (!step_slot_prefill()) return 1;
+                    } else if (!(piped ? pump(true) : batch_step())) {
+                        return 1;
+                    }
                     continue;
                 }
                 // a request reads its prompt through every stage: the groups in flight finish first
@@ -12478,10 +13295,24 @@ static int qwen4exp_engine_main(int argc, char** argv) {
             // request's prompt and first token as a GEN 1, then continues it in that slot
             if (line.rfind("BSTOP ", 0) == 0) {
                 const int b = std::atoi(line.c_str() + 6);
-                if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
+                if (b >= 0 && b < (int) bs.size()) {
+                    if (bs[(size_t) b].prefilling) cancel_slot_prefill(b, "cancel");
+                    else bs[(size_t) b].stop = true;
+                }
                 continue;
             }
-            if (line.rfind("BYIELD", 0) == 0 || line.rfind("BSHARE", 0) == 0) continue;   // for a prompt read that has ended meanwhile
+            if (line.rfind("BSHARE ", 0) == 0) {
+                session_decode_share = std::max(0.0, std::atof(line.c_str() + 7));
+                continue;
+            }
+            if (line.rfind("BYIELD", 0) == 0) continue;   // for a prompt read that has ended meanwhile
+            if (line.rfind("BPREFILL ", 0) == 0) {
+                (void) start_slot_prefill(line);
+                continue;
+            }
+            while (any_prefilling()) {
+                if (!step_slot_prefill()) return 1;
+            }
             if (line.rfind("VRAM", 0) == 0) {   // #533 (above): between requests, not a request
                 std::string verr;
                 if (batch_on()) verr = "VRAM: not while batch slots are decoding";

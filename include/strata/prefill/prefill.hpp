@@ -128,6 +128,10 @@ public:
     /// first, -1 for none) and is advanced to the last two of these.
     bool run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
 
+    /// Retargets this initialized Prefill workspace to another SessionState (for zero-copy slot-resident prefill).
+    void set_session(core::SessionState* s);
+    bool borrowed() const;
+
     const PrefillStats& stats() const { return stats_; }
 
     /// multi-GPU: the experts the peer GPU holds are computed THERE for every prompt chunk (up to `cap_rows` routed

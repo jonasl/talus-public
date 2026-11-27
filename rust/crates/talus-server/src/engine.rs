@@ -1346,6 +1346,7 @@ impl ScriptedMockEngine {
                             && yields < YIELDS_MAX
                             && b.waiters.shorter_waiting(prompt.len())
                     }),
+                    None,
                     cancel,
                     &mut |t, lp| {
                         if is_stop(t) && !req.sampling.ignore_eos {
@@ -2977,6 +2978,10 @@ pub struct StdioSubprocessEngine {
     admit_epoch: AtomicU64,
     /// Whether a request that finds the engine alone runs on the solo path (`parallel_solo`).
     parallel_solo: AtomicBool,
+    /// Whether `STRATA_BATCH_DECODE_SHARE` adapts dynamically when other requests queue (`--adaptive-decode-share`).
+    adaptive_decode_share: AtomicBool,
+    base_decode_share: f64,
+    queued_decode_share: f64,
 }
 
 /// Prefix of the error when the command could not be written: the engine never saw the request, so it can be sent again
@@ -3082,6 +3087,22 @@ impl StdioSubprocessEngine {
     /// The solo-if-idle policy switch (`parallel_solo` in the run config, on unless told).
     pub fn set_parallel_solo(&self, on: bool) {
         self.parallel_solo.store(on, Ordering::Relaxed);
+    }
+
+    /// Adaptive `STRATA_BATCH_DECODE_SHARE` switch (`--adaptive-decode-share`, off by default).
+    pub fn set_adaptive_decode_share(&self, on: bool) {
+        self.adaptive_decode_share.store(on, Ordering::Relaxed);
+    }
+
+    fn current_decode_share(&self) -> Option<f64> {
+        if !self.adaptive_decode_share.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some(if self.waiters.count() > 0 {
+            self.queued_decode_share
+        } else {
+            self.base_decode_share
+        })
     }
 
     /// Take `proc` the way Python takes the control lines: waiting is cancellable. With the
@@ -3193,6 +3214,20 @@ impl StdioSubprocessEngine {
             Self::start(&exe_path, args, env, cwd, log, default_ctx, &stderr_tail)?;
         let mut tok = ByteTokenizer::new();
         tok.stop_tokens = ready.stop_token.into_iter().collect();
+        let base_decode_share = env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == "STRATA_BATCH_DECODE_SHARE" || k == "TALUS_BATCH_DECODE_SHARE")
+            .map(|(_, v)| v.clone())
+            .or_else(|| {
+                std::env::var("STRATA_BATCH_DECODE_SHARE")
+                    .or_else(|_| std::env::var("TALUS_BATCH_DECODE_SHARE"))
+                    .ok()
+            })
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .map(|v| v.max(0.0))
+            .unwrap_or(0.5);
+        let queued_decode_share = base_decode_share.min(0.2);
         let engine = Self {
             exe: exe_path,
             args: args.to_vec(),
@@ -3213,6 +3248,9 @@ impl StdioSubprocessEngine {
             waiters: Waiters::default(),
             admit_epoch: AtomicU64::new(0),
             parallel_solo: AtomicBool::new(true),
+            adaptive_decode_share: AtomicBool::new(false),
+            base_decode_share,
+            queued_decode_share,
         };
         engine.install(&mut engine.proc.lock().unwrap(), handle);
         Ok(engine)
@@ -3629,6 +3667,9 @@ impl StdioSubprocessEngine {
         // and the server's size predictions ride for the tower to check - both keys before the
         // emb-path token, which is the engine's own line order.
         let mut keys = req.sampling.to_gen_keys();
+        if let Some(ds) = self.current_decode_share() {
+            keys += &format!(" decode_share={ds:.3}");
+        }
         let mut frame = None;
         if let (Some(f), true) = (&req.raw_frame, req.embeddings.as_deref() == Some("@raw")) {
             keys += &format!(
@@ -3703,6 +3744,7 @@ impl StdioSubprocessEngine {
         let mut pending_lp: Option<TokenLogprob> = None;
         let mut reserved: Option<usize> = None; // the slot asked to hold a part read
         let mut yielded: Option<usize> = None; // ... and the engine agreed (token count)
+        let mut last_share = self.current_decode_share();
 
         // nothing from the engine for this request yet
         let mut answered = false;
@@ -3723,6 +3765,18 @@ impl StdioSubprocessEngine {
                     // heartbeat, the twin of its `on_quiet` - is where a waiting shorter
                     // request asks the read to stop into a slot (#656). The engine takes
                     // it at its next chunk boundary.
+                    if emitted.is_empty() && !stop_sent {
+                        if let Some(next) = self.current_decode_share() {
+                            if last_share.is_none_or(|prev| (prev - next).abs() > 1e-6) {
+                                if let Ok(mut stdin) = handle.stdin.lock() {
+                                    let _ =
+                                        stdin.write_all(format!("BSHARE {next:.3}\n").as_bytes());
+                                    let _ = stdin.flush();
+                                }
+                                last_share = Some(next);
+                            }
+                        }
+                    }
                     if reserved.is_none() && emitted.is_empty() && !stop_sent {
                         if let Some(s) = yield_way.as_ref().and_then(|f| f()) {
                             if let Ok(mut stdin) = handle.stdin.lock() {
@@ -3759,6 +3813,17 @@ impl StdioSubprocessEngine {
                     let read = f[0].parse::<usize>().unwrap_or(0);
                     let total = f[1].parse::<usize>().unwrap_or(0);
                     on_progress(reused + read, total);
+                }
+                if emitted.is_empty() && !stop_sent {
+                    if let Some(next) = self.current_decode_share() {
+                        if last_share.is_none_or(|prev| (prev - next).abs() > 1e-6) {
+                            if let Ok(mut stdin) = handle.stdin.lock() {
+                                let _ = stdin.write_all(format!("BSHARE {next:.3}\n").as_bytes());
+                                let _ = stdin.flush();
+                            }
+                            last_share = Some(next);
+                        }
+                    }
                 }
                 // The engine's chunk boundary, and nothing of the read's produced
                 // yet: a shorter request waiting makes the read stop here, into the
@@ -3937,6 +4002,7 @@ impl StdioSubprocessEngine {
             slot_hint,
             reserve,
             yield_way,
+            Some(&|| self.current_decode_share()),
             cancel,
             &mut |t, lp| {
                 if is_stop(t) && !req.sampling.ignore_eos {

@@ -139,7 +139,7 @@ impl<'a> BatchClient<'a> {
     /// and another tried, up to `BGEN_REFUSALS_MAX` times before the request fails. `cmd(slot)`
     /// builds the whole command line for the slot picked; `prompt` is the conversation's head,
     /// kept for a leaving slot's bookkeeping.
-    #[allow(clippy::too_many_arguments)] // the handshake's full hand: claim, hint, give-way, both sinks
+    #[allow(clippy::too_many_arguments)] // the handshake's full hand: claim, hint, give-way, share, both sinks
     pub(crate) fn admit(
         &self,
         cmd: &dyn Fn(usize) -> String,
@@ -148,6 +148,7 @@ impl<'a> BatchClient<'a> {
         slot_hint: Option<usize>,
         reserve: &mut dyn FnMut() -> Result<usize, EngineError>,
         yield_way: Option<&dyn Fn() -> bool>,
+        share_update: Option<&dyn Fn() -> Option<f64>>,
         cancel: &AtomicBool,
         on_token: &mut dyn FnMut(u32, Option<TokenLogprob>) -> bool,
         on_progress: &mut dyn FnMut(usize, usize),
@@ -164,6 +165,7 @@ impl<'a> BatchClient<'a> {
             // Required before the send: otherwise the new request reads what its predecessor
             // left in the queue.
             self.bus.drain_slot(slot);
+            let mut last_share = share_update.and_then(|f| f());
             let line = cmd(slot);
             self.sink.send(&line, frame)?;
             let written_at = Instant::now();
@@ -182,6 +184,14 @@ impl<'a> BatchClient<'a> {
                         if (cancel.load(Ordering::Relaxed) || aborted) && !stop_sent {
                             self.sink.send("STOP", None)?;
                             stop_sent = true;
+                        }
+                        if leg.admission.is_none() && !stop_sent {
+                            if let Some(next) = share_update.and_then(|f| f()) {
+                                if last_share.is_none_or(|prev| (prev - next).abs() > 1e-6) {
+                                    self.sink.send(&format!("BSHARE {next:.3}"), None)?;
+                                    last_share = Some(next);
+                                }
+                            }
                         }
                         // The same quiet tick as `generate_on`'s: the real engine's read
                         // says nothing while it runs its chunks (#656).
@@ -227,6 +237,14 @@ impl<'a> BatchClient<'a> {
                             // A read still ahead of its first token, and a shorter
                             // request waiting: the chunk boundary just reported is
                             // where the read stops, into this slot (server.py's #656).
+                            if leg.admission.is_none() && !stop_sent {
+                                if let Some(next) = share_update.and_then(|f| f()) {
+                                    if last_share.is_none_or(|prev| (prev - next).abs() > 1e-6) {
+                                        self.sink.send(&format!("BSHARE {next:.3}"), None)?;
+                                        last_share = Some(next);
+                                    }
+                                }
+                            }
                             if !asked && leg.admission.is_none() && yield_way.is_some_and(|f| f()) {
                                 self.sink.send(&format!("BYIELD {slot}"), None)?;
                                 asked = true;
@@ -1205,5 +1223,58 @@ mod tests {
             t0.elapsed()
         );
         assert!(bus.slots_idle(), "a swallowed BYIELD leaked its slot claim");
+    }
+
+    #[test]
+    fn admit_emits_bshare_when_share_update_changes() {
+        use std::sync::atomic::AtomicUsize;
+        let (bus, feeder) = EngineBus::manual(1);
+        let (tx, rx) = mpsc::channel::<String>();
+        let sink = ScriptSink(tx);
+        let client = BatchClient {
+            bus: &bus,
+            sink: &sink,
+            groups: 1,
+        };
+        let share_state = Arc::new(AtomicUsize::new(0));
+        let share_state_feed = share_state.clone();
+        std::thread::spawn(move || {
+            let cmd = rx.recv().unwrap();
+            assert!(cmd.starts_with("BGEN 0 "));
+            share_state_feed.store(1, Ordering::SeqCst);
+            feeder.push("PP 4096 8192 100.0 40960.0");
+            let bshare = rx.recv().unwrap();
+            assert_eq!(bshare, "BSHARE 0.200");
+            feeder.push("T 42");
+            feeder.push("DONE 1 10.0 1.0 stop 0 0 0");
+            feeder.push("BADM 0 0");
+        });
+        let cancel = AtomicBool::new(false);
+        let mut toks = Vec::new();
+        let leg = client
+            .admit(
+                &|s| format!("BGEN {s} 4 1,2,3"),
+                None,
+                &[1, 2, 3],
+                Some(0),
+                &mut || Ok(0),
+                None,
+                Some(&|| {
+                    Some(if share_state.load(Ordering::SeqCst) > 0 {
+                        0.2
+                    } else {
+                        0.5
+                    })
+                }),
+                &cancel,
+                &mut |t, _| {
+                    toks.push(t);
+                    true
+                },
+                &mut |_, _| {},
+            )
+            .unwrap();
+        assert_eq!(toks, vec![42]);
+        assert!(!leg.cont);
     }
 }

@@ -12,7 +12,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!(
-            "Usage: talus-server [--config <path.json>] [--host <addr>] [--port <port>] [--model-name <name>] [--model-alias <alias>] [--api-key <key>] [--mock] [--mock-stdio-worker]"
+            "Usage: talus-server [--config <path.json>] [--host <addr>] [--port <port>] [--model-name <name>] [--model-alias <alias>] [--api-key <key>] [--adaptive-decode-share] [--mock] [--mock-stdio-worker]"
         );
         return;
     }

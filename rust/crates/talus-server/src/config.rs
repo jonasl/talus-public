@@ -80,6 +80,10 @@ pub struct ServerConfig {
     /// work). `false` keeps every eligible request in a slot from admission on (run config
     /// `"parallel_solo": false`, `--no-parallel-solo`).
     pub parallel_solo: bool,
+    /// Adapt `STRATA_BATCH_DECODE_SHARE` dynamically while other requests are queued behind a
+    /// prompt read (`--adaptive-decode-share`, `"adaptive_decode_share": true`). Default `false`
+    /// keeps fixed `STRATA_BATCH_DECODE_SHARE` behavior.
+    pub adaptive_decode_share: bool,
     pub slot_save_path: String,
     pub idle_unload_seconds: u64,
     pub mock_mode: bool,
@@ -144,6 +148,7 @@ impl Default for ServerConfig {
             fit: "off".to_string(),
             ctx_shift: false,
             parallel_solo: true,
+            adaptive_decode_share: false,
             slot_save_path: String::new(),
             idle_unload_seconds: 0,
             mock_mode: true,
@@ -377,6 +382,9 @@ impl ServerConfig {
         if let Some(ps) = val.get_bool("parallel_solo") {
             cfg.parallel_solo = ps;
         }
+        if let Some(ads) = val.get_bool("adaptive_decode_share") {
+            cfg.adaptive_decode_share = ads;
+        }
         if let Some(sp) = val
             .get_str("slot_save_path")
             .or_else(|| val.get_str("session_dir"))
@@ -472,6 +480,14 @@ impl ServerConfig {
                     }
                     "--no-parallel-solo" => {
                         cfg.parallel_solo = false;
+                        i += 1;
+                    }
+                    "--adaptive-decode-share" => {
+                        cfg.adaptive_decode_share = true;
+                        i += 1;
+                    }
+                    "--no-adaptive-decode-share" => {
+                        cfg.adaptive_decode_share = false;
                         i += 1;
                     }
                     "--kv-unified" | "-kvu" => {
@@ -694,6 +710,7 @@ impl ServerConfig {
         let mut chat_template_override: Option<PathBuf> = None;
         let mut idle_unload_override: Option<u64> = None;
         let mut fit_max_tokens_override: Option<bool> = None;
+        let mut adaptive_decode_share_override: Option<bool> = None;
         let mut mock_override: Option<bool> = None;
         let mut mock_stdio_worker = false;
         let mut mock_scripts_override: Vec<String> = Vec::new();
@@ -813,6 +830,12 @@ impl ServerConfig {
                 "--no-fit-max-tokens" => {
                     fit_max_tokens_override = Some(false);
                 }
+                "--adaptive-decode-share" => {
+                    adaptive_decode_share_override = Some(true);
+                }
+                "--no-adaptive-decode-share" => {
+                    adaptive_decode_share_override = Some(false);
+                }
                 "--mock" => {
                     mock_override = Some(true);
                 }
@@ -897,6 +920,9 @@ impl ServerConfig {
         }
         if let Some(fmt) = fit_max_tokens_override {
             cfg.fit_max_tokens = fmt;
+        }
+        if let Some(ads) = adaptive_decode_share_override {
+            cfg.adaptive_decode_share = ads;
         }
         if let Some(m) = model_name_override {
             cfg.model_name = m;

@@ -166,6 +166,7 @@ impl ServiceState {
                 )
                 .map_err(|e| format!("failed to start engine {}: {e}", exe.display()))?;
                 sub.set_parallel_solo(config.parallel_solo);
+                sub.set_adaptive_decode_share(config.adaptive_decode_share);
                 if let Some(st) = sub.stop_token() {
                     if !tokenizer.stop_tokens.contains(&st) {
                         tokenizer.stop_tokens.push(st);

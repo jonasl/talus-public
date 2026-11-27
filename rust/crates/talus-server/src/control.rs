@@ -727,7 +727,11 @@ pub fn exec_args(orig: &[String], config: &Path) -> Vec<String> {
                 i += 2;
                 continue;
             }
-            "--mock" | "--fit-max-tokens" | "--no-fit-max-tokens" => out.push(a.to_string()),
+            "--mock"
+            | "--fit-max-tokens"
+            | "--no-fit-max-tokens"
+            | "--adaptive-decode-share"
+            | "--no-adaptive-decode-share" => out.push(a.to_string()),
             // flags with a value that the run config now decides (bare flags and positionals fall through)
             "--config"
             | "-c"
@@ -940,5 +944,29 @@ mod tests {
             ]
         );
         assert!(!got.iter().any(|a| a == "secret"));
+    }
+
+    #[test]
+    fn adaptive_decode_share_flag_and_config() {
+        let off = crate::config::ServerConfig::parse_cli_args(["--mock"]).unwrap();
+        assert!(!off.adaptive_decode_share);
+
+        let on = crate::config::ServerConfig::parse_cli_args(["--mock", "--adaptive-decode-share"])
+            .unwrap();
+        assert!(on.adaptive_decode_share);
+
+        let json_on = crate::config::ServerConfig::from_json(
+            &crate::json::JsonValue::parse(r#"{"adaptive_decode_share": true}"#).unwrap(),
+        )
+        .unwrap();
+        assert!(json_on.adaptive_decode_share);
+
+        let orig = vec![
+            "--config".to_string(),
+            "old.json".to_string(),
+            "--adaptive-decode-share".to_string(),
+        ];
+        let got = exec_args(&orig, Path::new("new.json"));
+        assert_eq!(got, ["--adaptive-decode-share", "--config", "new.json"]);
     }
 }

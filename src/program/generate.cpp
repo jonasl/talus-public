@@ -12481,7 +12481,7 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                 if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
                 continue;
             }
-            if (line.rfind("BYIELD", 0) == 0) continue;   // for a prompt read that has ended meanwhile
+            if (line.rfind("BYIELD", 0) == 0 || line.rfind("BSHARE", 0) == 0) continue;   // for a prompt read that has ended meanwhile
             if (line.rfind("VRAM", 0) == 0) {   // #533 (above): between requests, not a request
                 std::string verr;
                 if (batch_on()) verr = "VRAM: not while batch slots are decoding";
@@ -12828,6 +12828,11 @@ static int qwen4exp_engine_main(int argc, char** argv) {
             // Talus (llama.cpp's /completion): ignore_eos=1 runs to max_new through end-of-text tokens; cache=0 reads
             // the prompt from token 0 (no live session, checkpoint, idle slot or parked conversation is resumed).
             bool req_ignore_eos = false, req_cache = true;
+            static const double default_decode_share = [] {
+                const char* v = std::getenv("STRATA_BATCH_DECODE_SHARE");
+                return v != nullptr ? std::max(0.0, std::atof(v)) : 0.5;
+            }();
+            double req_decode_share = default_decode_share;
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
@@ -12868,6 +12873,7 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
+                    else if (key == "decode_share") req_decode_share = std::max(0.0, (double) fv);
                     else if (key == "aux_cpus") req_aux_cpus = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
                     else if (key == "img_keys") {
                         req_img_keys.clear();
@@ -13803,13 +13809,8 @@ static int qwen4exp_engine_main(int argc, char** argv) {
             };
             // --batch: a prompt read while slots are decoding goes one prompt chunk at a time (the same chunks as one
             // run: each run starts where the last ended, at a multiple of the chunk), and between two chunks the slots
-            // decode for a share of the time the chunk took (STRATA_BATCH_DECODE_SHARE, default 0.5), so a long
-            // prompt does not stop the others.  The slots' windows then see the cache without the slots this prompt
-            // borrowed (marked missing: those experts run on the CPU), never a prompt buffer.
-            static const double decode_share = [] {
-                const char* v = std::getenv("STRATA_BATCH_DECODE_SHARE");
-                return v != nullptr ? std::max(0.0, std::atof(v)) : 0.5;
-            }();
+            // decode for a share of the time the chunk took (STRATA_BATCH_DECODE_SHARE, default 0.5, or adaptive when
+            // --adaptive-decode-share is enabled on talus-server), so a long prompt does not stop the others.
             bool batch_fatal = false;
             int64_t il_parts = 0;   // the slots' windows run between this prompt's chunks
             double il_ms = 0;
@@ -13862,6 +13863,9 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                             } else if (it->rfind("BYIELD ", 0) == 0) {
                                 ys = std::atoi(it->c_str() + 7);
                                 it = in_lines.erase(it);
+                            } else if (it->rfind("BSHARE ", 0) == 0) {
+                                req_decode_share = std::max(0.0, std::atof(it->c_str() + 7));
+                                it = in_lines.erase(it);
                             } else {
                                 ++it;
                             }
@@ -13900,8 +13904,8 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                         std::fprintf(stderr, "talus batch: BYIELD %d not taken at %lld of %lld%s%s\n", ys, (long long) q,
                                      (long long) n, ye.empty() ? "" : ": ", ye.c_str());
                     }
-                    if (decode_share <= 0.0 || !batch_on()) return true;
-                    const double budget = decode_share * std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
+                    if (req_decode_share <= 0.0 || !batch_on()) return true;
+                    const double budget = req_decode_share * std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
                     const auto td = Clock::now();
                     in_prompt_read = true;
                     do {

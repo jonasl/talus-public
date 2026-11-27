@@ -1209,6 +1209,9 @@ impl ScriptedMockEngine {
         // its window with a `BSTOP` and continues on the control lines (server.py's
         // `_may_go_solo`) - and a read ahead of its first token stops at a chunk
         // boundary into a slot when a much shorter request waits (#656's `BYIELD`).
+        let orig_prompt_len = req.prompt_ids.len();
+        let mut reused_at_start: Option<usize> = None;
+        let mut yield_prompt_ms = 0.0f64;
         let mut carry: Vec<EngineTimings> = Vec::new();
         let mut emitted_total = 0usize;
         let mut pulls = 0usize;
@@ -1255,15 +1258,33 @@ impl ScriptedMockEngine {
                         on_token,
                         on_progress,
                     )? {
-                        SoloOutcome::Done(t) => return Ok(composed(&carry, t)),
+                        SoloOutcome::Done(t) => {
+                            return Ok(composed(
+                                &carry,
+                                finalize_prompt_timings(
+                                    t,
+                                    orig_prompt_len,
+                                    &mut reused_at_start,
+                                    &mut yield_prompt_ms,
+                                ),
+                            ));
+                        }
                         SoloOutcome::Yielded {
                             reserved,
                             read,
-                            timings,
+                            mut timings,
                         } => {
                             yields += 1;
+                            if reused_at_start.is_none() {
+                                reused_at_start = Some(timings.cache_n.min(orig_prompt_len));
+                            }
+                            yield_prompt_ms += timings.prompt_ms;
                             if cancel.load(Ordering::Relaxed) {
                                 b.bus.release_done(reserved, held_prefix(&prompt, read));
+                                timings.prompt_ms = yield_prompt_ms;
+                                let cache_n = reused_at_start.unwrap_or(timings.cache_n);
+                                timings.cache_n = cache_n;
+                                timings.prompt_n = read.saturating_sub(cache_n);
                                 return Ok(composed(&carry, timings));
                             }
                             // The re-take behind the shorter waiters, as the real
@@ -1275,16 +1296,21 @@ impl ScriptedMockEngine {
                             slot_hint = Some(reserved);
                         }
                         SoloOutcome::Evicted { emitted, timings } => {
+                            let mut t = finalize_prompt_timings(
+                                timings,
+                                orig_prompt_len,
+                                &mut reused_at_start,
+                                &mut yield_prompt_ms,
+                            );
                             if cancel.load(Ordering::Relaxed) {
-                                return Ok(composed(&carry, timings));
+                                return Ok(composed(&carry, t));
                             }
                             let spent = emitted.len();
                             if left.saturating_sub(spent) == 0 {
-                                let mut t = timings;
                                 t.finish_reason = "length".to_string();
                                 return Ok(composed(&carry, t));
                             }
-                            carry.push(timings);
+                            carry.push(t);
                             emitted_total += spent;
                             prompt.extend(emitted);
                         }
@@ -1359,17 +1385,23 @@ impl ScriptedMockEngine {
                 )?;
                 r
             };
-            if let Some(_read) = leg.yielded {
+            if let Some(read) = leg.yielded {
                 // The mock mirrors `generate_with_logprobs` here too: re-take the
                 // lines behind the shorter waiters and finish the read in the slot.
                 yields += 1;
+                let leg_reused = leg.done_reused.unwrap_or(leg.reused).min(orig_prompt_len);
+                if reused_at_start.is_none() {
+                    reused_at_start = Some(leg_reused);
+                }
+                yield_prompt_ms += leg.prompt_ms;
                 if cancel.load(Ordering::Relaxed) {
+                    let cache_n = reused_at_start.unwrap_or(leg_reused);
                     return Ok(composed(
                         &carry,
                         EngineTimings {
-                            cache_n: leg.reused,
-                            prompt_n: leg.prompt_n,
-                            prompt_ms: leg.prompt_ms,
+                            cache_n,
+                            prompt_n: read.saturating_sub(cache_n),
+                            prompt_ms: yield_prompt_ms,
                             predicted_n: 0,
                             predicted_ms: 0.5,
                             draft_n: None,
@@ -1389,20 +1421,25 @@ impl ScriptedMockEngine {
                 // the slot (if it continued) and handed its lines to the router.
                 return Ok(composed(
                     &carry,
-                    EngineTimings {
-                        cache_n: leg.reused,
-                        prompt_n: leg.prompt_n,
-                        prompt_ms: leg.prompt_ms,
-                        predicted_n: 0,
-                        predicted_ms: 0.5,
-                        draft_n: None,
-                        draft_accepted: None,
-                        finish_reason: if leg.finish == "stop" {
-                            "stop".to_string()
-                        } else {
-                            "cancel".to_string()
+                    finalize_prompt_timings(
+                        EngineTimings {
+                            cache_n: leg.reused,
+                            prompt_n: leg.prompt_n,
+                            prompt_ms: leg.prompt_ms,
+                            predicted_n: 0,
+                            predicted_ms: 0.5,
+                            draft_n: None,
+                            draft_accepted: None,
+                            finish_reason: if leg.finish == "stop" {
+                                "stop".to_string()
+                            } else {
+                                "cancel".to_string()
+                            },
                         },
-                    },
+                        orig_prompt_len,
+                        &mut reused_at_start,
+                        &mut yield_prompt_ms,
+                    ),
                 ));
             }
             if !leg.cont {
@@ -1411,24 +1448,29 @@ impl ScriptedMockEngine {
                 // does not count as predicted.
                 return Ok(composed(
                     &carry,
-                    EngineTimings {
-                        cache_n: leg.reused,
-                        prompt_n: leg.prompt_n,
-                        prompt_ms: leg.prompt_ms,
-                        predicted_n: leg
-                            .admission
-                            .into_iter()
-                            .count()
-                            .saturating_sub(if leg.finish == "stop" { 1 } else { 0 }),
-                        predicted_ms: 0.5,
-                        draft_n: None,
-                        draft_accepted: None,
-                        finish_reason: if leg.finish.is_empty() {
-                            "length".to_string()
-                        } else {
-                            leg.finish
+                    finalize_prompt_timings(
+                        EngineTimings {
+                            cache_n: leg.reused,
+                            prompt_n: leg.prompt_n,
+                            prompt_ms: leg.prompt_ms,
+                            predicted_n: leg
+                                .admission
+                                .into_iter()
+                                .count()
+                                .saturating_sub(if leg.finish == "stop" { 1 } else { 0 }),
+                            predicted_ms: 0.5,
+                            draft_n: None,
+                            draft_accepted: None,
+                            finish_reason: if leg.finish.is_empty() {
+                                "length".to_string()
+                            } else {
+                                leg.finish
+                            },
                         },
-                    },
+                        orig_prompt_len,
+                        &mut reused_at_start,
+                        &mut yield_prompt_ms,
+                    ),
                 ));
             }
             let emitted: Vec<u32> = leg.admission.into_iter().collect();
@@ -1470,20 +1512,25 @@ impl ScriptedMockEngine {
                 "stop" | "abort" => 1,
                 _ => 0,
             };
-            let timings = EngineTimings {
-                cache_n: leg.reused,
-                prompt_n: leg.prompt_n,
-                prompt_ms: leg.prompt_ms,
-                predicted_n: res.produced.saturating_sub(suppressed),
-                predicted_ms: res.decode_ms.max(0.5),
-                draft_n: None,
-                draft_accepted: None,
-                finish_reason: if res.finish == "abort" {
-                    "stop".to_string()
-                } else {
-                    res.finish.clone()
+            let timings = finalize_prompt_timings(
+                EngineTimings {
+                    cache_n: leg.reused,
+                    prompt_n: leg.prompt_n,
+                    prompt_ms: leg.prompt_ms,
+                    predicted_n: res.produced.saturating_sub(suppressed),
+                    predicted_ms: res.decode_ms.max(0.5),
+                    draft_n: None,
+                    draft_accepted: None,
+                    finish_reason: if res.finish == "abort" {
+                        "stop".to_string()
+                    } else {
+                        res.finish.clone()
+                    },
                 },
-            };
+                orig_prompt_len,
+                &mut reused_at_start,
+                &mut yield_prompt_ms,
+            );
             if res.pulled_back
                 && res.finish == "cancel"
                 && !cancel.load(Ordering::Relaxed)
@@ -2934,16 +2981,40 @@ fn compose_legs_all(legs: &[EngineTimings], last: EngineTimings) -> EngineTiming
 }
 
 /// #1869's composition: a request whose first leg ended in a hand-over reports one total -
-/// the decode figures sum across legs, the prompt time is the bigger read's (the second leg
-/// re-reads through the engine's caches, and what it did reuse is its own `cache_n`), and the
-/// finish and the rest are the leg that ended the exchange.
+/// the decode figures sum across legs, the prompt time is the bigger read's, and the prompt
+/// reuse/read split (`cache_n`, `prompt_n`) stays the original request's (`first`) rather than
+/// the re-admitted hand-over leg's (`last`, which sees the first leg's tokens as cached).
 fn compose_legs(first: &EngineTimings, last: EngineTimings) -> EngineTimings {
     EngineTimings {
+        cache_n: first.cache_n,
+        prompt_n: first.prompt_n,
         prompt_ms: first.prompt_ms.max(last.prompt_ms),
         predicted_n: first.predicted_n + last.predicted_n,
         predicted_ms: first.predicted_ms + last.predicted_ms,
         ..last
     }
+}
+
+/// Fold `BYIELD` prefix-read time and initial reuse (`reused_at_start`) into the leg that
+/// completes the prompt read, so resumed `BGEN` legs do not count tokens read earlier by this
+/// same request as pre-existing `cache_n`.
+fn finalize_prompt_timings(
+    mut t: EngineTimings,
+    orig_prompt_len: usize,
+    reused_at_start: &mut Option<usize>,
+    yield_prompt_ms: &mut f64,
+) -> EngineTimings {
+    if reused_at_start.is_none() {
+        *reused_at_start = Some(t.cache_n.min(orig_prompt_len));
+    }
+    if *yield_prompt_ms > 0.0 {
+        t.prompt_ms += *yield_prompt_ms;
+        *yield_prompt_ms = 0.0;
+        let cache_n = reused_at_start.unwrap_or(t.cache_n);
+        t.cache_n = cache_n;
+        t.prompt_n = orig_prompt_len.saturating_sub(cache_n);
+    }
+    t
 }
 
 /// Subprocess engine that spawns an external executable speaking the Strata/Talus stdio protocol:
@@ -4428,6 +4499,9 @@ impl Engine for StdioSubprocessEngine {
         // consumer's stream whole; the generation legs ride back as one exchange
         // through #1869's carry rule, the give-way legs through the engine's own
         // resume of its read.
+        let orig_prompt_len = req.prompt_ids.len();
+        let mut reused_at_start: Option<usize> = None;
+        let mut yield_prompt_ms = 0.0f64;
         let mut carry: Vec<EngineTimings> = Vec::new();
         let mut emitted_total = 0usize;
         let mut pulls = 0usize;
@@ -4482,22 +4556,40 @@ impl Engine for StdioSubprocessEngine {
                     other => other,
                 };
                 match outcome {
-                    Ok(SoloOutcome::Done(t)) => return composed(&carry, Ok(t)),
+                    Ok(SoloOutcome::Done(t)) => {
+                        return composed(
+                            &carry,
+                            Ok(finalize_prompt_timings(
+                                t,
+                                orig_prompt_len,
+                                &mut reused_at_start,
+                                &mut yield_prompt_ms,
+                            )),
+                        );
+                    }
                     Ok(SoloOutcome::Yielded {
                         reserved,
                         read,
-                        timings,
+                        mut timings,
                     }) => {
                         eprintln!(
                             "[talus-server] solo read gave way at token {read} of {} into slot {reserved}",
                             prompt.len()
                         );
                         yields += 1;
+                        if reused_at_start.is_none() {
+                            reused_at_start = Some(timings.cache_n.min(orig_prompt_len));
+                        }
+                        yield_prompt_ms += timings.prompt_ms;
                         if cancel.load(Ordering::Relaxed) {
                             // Leaving: the parked slot goes back holding what the
                             // engine read, and the leg's own figures are all anyone
                             // has of the exchange.
                             bus.release_done(reserved, held_prefix(&prompt, read));
+                            timings.prompt_ms = yield_prompt_ms;
+                            let cache_n = reused_at_start.unwrap_or(timings.cache_n);
+                            timings.cache_n = cache_n;
+                            timings.prompt_n = read.saturating_sub(cache_n);
                             return composed(&carry, Ok(timings));
                         }
                         // serve/server.py's re-take after a give-way: the lines go
@@ -4518,18 +4610,23 @@ impl Engine for StdioSubprocessEngine {
                         slot_hint = Some(reserved);
                     }
                     Ok(SoloOutcome::Evicted { emitted, timings }) => {
+                        let mut t = finalize_prompt_timings(
+                            timings,
+                            orig_prompt_len,
+                            &mut reused_at_start,
+                            &mut yield_prompt_ms,
+                        );
                         // Python's checks before a promotion: the consumer left, or the
                         // exchange ended on its own along with (or before) the hand-over.
                         if cancel.load(Ordering::Relaxed) {
-                            return composed(&carry, Ok(timings));
+                            return composed(&carry, Ok(t));
                         }
                         let spent = emitted.len();
                         if left.saturating_sub(spent) == 0 {
-                            let mut t = timings;
                             t.finish_reason = "length".to_string();
                             return composed(&carry, Ok(t));
                         }
-                        carry.push(timings);
+                        carry.push(t);
                         emitted_total += spent;
                         prompt.extend(emitted);
                     }
@@ -4593,13 +4690,20 @@ impl Engine for StdioSubprocessEngine {
                 // claim rides over, and the request re-takes the lines behind the
                 // shorter ones it yielded to - the same re-take as the solo leg's.
                 yields += 1;
+                let leg_reused = leg.done_reused.unwrap_or(leg.reused).min(orig_prompt_len);
+                if reused_at_start.is_none() {
+                    reused_at_start = Some(leg_reused);
+                }
+                yield_prompt_ms += leg.prompt_ms;
                 if cancel.load(Ordering::Relaxed) {
                     // admit settled the parked slot on its way out.
                     let produced = leg.admission.into_iter().count();
-                    return composed(
-                        &carry,
-                        self.slot_timings(&leg, produced, 0.0, "cancel", &cancel),
-                    );
+                    let mut t = self.slot_timings(&leg, produced, 0.0, "cancel", &cancel)?;
+                    t.prompt_ms = yield_prompt_ms;
+                    let cache_n = reused_at_start.unwrap_or(t.cache_n);
+                    t.cache_n = cache_n;
+                    t.prompt_n = read.saturating_sub(cache_n);
+                    return composed(&carry, Ok(t));
                 }
                 std::mem::drop(slot.take());
                 let _t = re_take_turn(&self.waiters, &self.admit_epoch, &cancel, prompt.len());
@@ -4628,7 +4732,15 @@ impl Engine for StdioSubprocessEngine {
                             "stop"
                         },
                         &cancel,
-                    ),
+                    )
+                    .map(|t| {
+                        finalize_prompt_timings(
+                            t,
+                            orig_prompt_len,
+                            &mut reused_at_start,
+                            &mut yield_prompt_ms,
+                        )
+                    }),
                 );
             }
             if !leg.cont {
@@ -4636,7 +4748,15 @@ impl Engine for StdioSubprocessEngine {
                 let finish = leg.finish.clone();
                 return composed(
                     &carry,
-                    self.slot_timings(&leg, produced, 0.0, &finish, &cancel),
+                    self.slot_timings(&leg, produced, 0.0, &finish, &cancel)
+                        .map(|t| {
+                            finalize_prompt_timings(
+                                t,
+                                orig_prompt_len,
+                                &mut reused_at_start,
+                                &mut yield_prompt_ms,
+                            )
+                        }),
                 );
             }
             // Let the engine go: the pump reads only the slot's routed lines. (The
@@ -4665,7 +4785,12 @@ impl Engine for StdioSubprocessEngine {
                     // The leg came back for the solo path's drafts. Re-run the policy
                     // above, which alone decides whether the solo path is still free - as
                     // Python's outer loop does on the pull-back's `break`.
-                    carry.push(timings);
+                    carry.push(finalize_prompt_timings(
+                        timings,
+                        orig_prompt_len,
+                        &mut reused_at_start,
+                        &mut yield_prompt_ms,
+                    ));
                     emitted_total += emitted.len();
                     prompt.extend(emitted);
                     pulls += 1;
@@ -4674,10 +4799,17 @@ impl Engine for StdioSubprocessEngine {
                 }
                 other => composed(
                     &carry,
-                    other.map(|o| match o {
-                        SlotOutcome::Done(t) => t,
-                        // Unreachable without the hand-over above; the types still allow it.
-                        SlotOutcome::PulledBack { timings, .. } => timings,
+                    other.map(|o| {
+                        finalize_prompt_timings(
+                            match o {
+                                SlotOutcome::Done(t) => t,
+                                // Unreachable without the hand-over above; the types still allow it.
+                                SlotOutcome::PulledBack { timings, .. } => timings,
+                            },
+                            orig_prompt_len,
+                            &mut reused_at_start,
+                            &mut yield_prompt_ms,
+                        )
                     }),
                 ),
             };
@@ -5099,7 +5231,7 @@ mod session_reply_tests {
 
 #[cfg(test)]
 mod solo_policy_tests {
-    use super::{compose_legs, EngineTimings};
+    use super::{compose_legs, finalize_prompt_timings, EngineTimings};
 
     fn leg(
         cache_n: usize,
@@ -5123,17 +5255,54 @@ mod solo_policy_tests {
 
     #[test]
     fn a_handover_reports_one_total_across_the_legs() {
-        // #1869's rule: the decode figures sum, the prompt time is the bigger read's, and the
-        // finish (and reuse view) is the leg that ended the exchange.
+        // The decode figures sum, the prompt time is the bigger read's, the finish is the leg
+        // that ended the exchange, and the prompt reuse/read split (`cache_n`/`prompt_n`) stays
+        // the original request's rather than the re-admitted hand-over leg's.
         let first = leg(4, 66, 41.0, 3, 90.0, "cancel");
         let last = leg(69, 2, 1.5, 4, 20.0, "length");
         let t = compose_legs(&first, last);
         assert_eq!(t.prompt_ms, 41.0);
         assert_eq!(t.predicted_n, 7);
         assert_eq!(t.predicted_ms, 110.0);
-        assert_eq!(t.cache_n, 69);
-        assert_eq!(t.prompt_n, 2);
+        assert_eq!(t.cache_n, 4);
+        assert_eq!(t.prompt_n, 66);
         assert_eq!(t.finish_reason, "length");
+    }
+
+    #[test]
+    fn yield_legs_accumulate_prompt_ms_and_keep_initial_cache_n() {
+        let orig_prompt_len = 65637;
+        // Leg 1: solo prompt read reuses 100 tokens from an earlier turn, reads 16384 in 14s, then yields.
+        let y1 = leg(100, 16284, 14000.0, 0, 0.0, "cancel");
+        let mut reused_at_start = Some(y1.cache_n.min(orig_prompt_len));
+        let mut yield_prompt_ms = y1.prompt_ms;
+
+        // Leg 2: resumed BGEN reads next 16384 in 15s, then yields again.
+        let y2 = leg(16384, 16384, 15000.0, 0, 0.0, "cancel");
+        yield_prompt_ms += y2.prompt_ms;
+
+        // Leg 3: resumed BGEN finishes remaining tokens in 27s and enters slot decode.
+        let bgen_done = leg(32768, 32869, 27000.0, 128, 3000.0, "length");
+        let t = finalize_prompt_timings(
+            bgen_done,
+            orig_prompt_len,
+            &mut reused_at_start,
+            &mut yield_prompt_ms,
+        );
+        assert_eq!(t.cache_n, 100);
+        assert_eq!(t.prompt_n, 65537);
+        assert_eq!(t.prompt_ms, 56000.0);
+        assert_eq!(yield_prompt_ms, 0.0);
+
+        // If leg 3 later pulls back to solo (which sees all 65637 + generated tokens cached),
+        // compose_legs preserves the true initial split and total prompt_ms.
+        let solo_tail = leg(65637 + 64, 1, 5.0, 64, 1200.0, "stop");
+        let combined = compose_legs(&t, solo_tail);
+        assert_eq!(combined.cache_n, 100);
+        assert_eq!(combined.prompt_n, 65537);
+        assert_eq!(combined.prompt_ms, 56000.0);
+        assert_eq!(combined.predicted_n, 192);
+        assert_eq!(combined.finish_reason, "stop");
     }
 
     #[test]

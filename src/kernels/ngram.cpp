@@ -19,6 +19,7 @@
 #endif
 #include <algorithm>
 #include <atomic>
+#include <mutex>
 #include <thread>
 #include <vector>
 #include <stdexcept>
@@ -222,6 +223,7 @@ struct PleTable::Impl {
     uint8_t prefetch_raw[kMaxPrefetch][PLE_N_HEADS * PLE_ROW_BYTES_MAX] = {};
     float scale = 1.0f;               // the FP8 table's one scale
     uint32_t rb = PLE_ROW_BYTES;      // bytes per row
+    std::mutex mu;
     void decode(const uint8_t* row, float* out160) const { fmt->dequant(row, scale, out160); }
 };
 
@@ -540,6 +542,7 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
         err = e;
         return false;
     }   // qwen4exp-r1
+    std::lock_guard<std::mutex> lk(impl_->mu);
     if (impl_->pending) { err = "PleTable::gather_batch while a token is in flight"; return false; }
     const size_t n = n_tokens * (size_t) PLE_N_HEADS;
     if (impl_->mode == PleIo::Direct) {

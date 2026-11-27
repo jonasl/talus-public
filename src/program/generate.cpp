@@ -8629,7 +8629,7 @@ static int qwen4exp_engine_main(int argc, char** argv) {
         std::vector<ImgKey> live_imgs, req_imgs;
         bool live_ok = false;
         // #879: a window met non-finite logits: the next request drops every cached state first and reads from token 0
-        bool nan_flush = false;
+        std::atomic<bool> nan_flush{false};
         std::vector<ConvCheckpoint> checks;
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
         int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
@@ -10426,7 +10426,12 @@ static int qwen4exp_engine_main(int argc, char** argv) {
             const char* v = std::getenv("STRATA_BATCH_DECODE_SHARE");
             return v != nullptr ? std::max(0.0, std::atof(v)) : 0.5;
         }();
-        double session_decode_share = default_decode_share;
+        std::atomic<double> session_decode_share{default_decode_share};
+        std::mutex batch_mu;
+        static const bool batch_overlap_env = [] {
+            const char* v = std::getenv("TALUS_BATCH_OVERLAP");
+            return v == nullptr || v[0] != '0';
+        }();
         auto any_prefilling = [&] { for (const BSlot& b : bs) if (b.prefilling) return true; return false; };
         // timing of the batch windows since the slots were last all idle (one stderr line then)
         double bt_run = 0, bt_commit = 0, bt_emit = 0;
@@ -12652,7 +12657,7 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                 else if (key == "penalty_freq") req_penalty_freq = fv;
                 else if (key == "penalty_present") req_penalty_present = fv;
                 else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
-                else if (key == "decode_share") session_decode_share = std::max(0.0, (double) fv);
+                else if (key == "decode_share") session_decode_share.store(std::max(0.0, (double) fv), std::memory_order_release);
                 else if (key == "logit_bias") {
                     std::printf("BPERR %d logit_bias is not supported with continuous batching\n", slot);
                     std::fflush(stdout);
@@ -13125,19 +13130,35 @@ static int qwen4exp_engine_main(int argc, char** argv) {
             if (sl.pf_read_at >= sl.pf_n - 1 || sl.pf_cut_idx >= sl.pf_cuts.size()) {
                 return finish_slot_prefill(p_slot);
             }
+            const bool prev_busy = strata::core::progress().busy.exchange(true, std::memory_order_relaxed);
             const int64_t to = sl.pf_cuts[sl.pf_cut_idx];
             sp.set_session(bslot_ss[0][(size_t) p_slot].get());
             sp.embd_rows = nullptr;
             if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(sl.pf_want_cvec);
             drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
 
+            std::atomic<bool> ov_stop{false};
+            std::atomic<bool> ov_err{false};
+            std::thread ov_thr;
+            const bool overlap_active = slot_prefill_enabled && batch_overlap_env && ver.all_resident_active() && batch_on();
+
             struct SlotHookGuard {
                 std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_ch;
                 std::function<bool(int64_t, std::string&)>& b_hook;
                 strata::prefill::Prefill& sp_ref;
                 strata::core::SessionState* orig_ss;
-                ~SlotHookGuard() { on_ch = nullptr; b_hook = nullptr; sp_ref.set_session(orig_ss); }
-            } sguard{slot_on_chunk_hook, batch_chunk_hook, sp, &ss};
+                std::atomic<bool>& ov_stop_ref;
+                std::thread& ov_thr_ref;
+                bool prev_busy_val;
+                ~SlotHookGuard() {
+                    ov_stop_ref.store(true, std::memory_order_release);
+                    if (ov_thr_ref.joinable()) ov_thr_ref.join();
+                    on_ch = nullptr;
+                    b_hook = nullptr;
+                    sp_ref.set_session(orig_ss);
+                    strata::core::progress().busy.store(prev_busy_val, std::memory_order_relaxed);
+                }
+            } sguard{slot_on_chunk_hook, batch_chunk_hook, sp, &ss, ov_stop, ov_thr, prev_busy};
 
             sl.pf_chunk_t0 = Clock::now();
             slot_on_chunk_hook = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
@@ -13180,11 +13201,16 @@ static int qwen4exp_engine_main(int argc, char** argv) {
             batch_chunk_hook = [&](int64_t done, std::string& be) -> bool {
                 const double chunk_ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.pf_chunk_t0).count();
                 sl.pf_read_at = done;
+                if (ov_err.load(std::memory_order_acquire)) {
+                    be = "a batch window failed";
+                    return false;
+                }
                 std::string in_line;
                 while (try_next_line(in_line)) {
                     if (in_line.rfind("BSTOP ", 0) == 0) {
                         const int b = std::atoi(in_line.c_str() + 6);
                         if (b >= 0 && b < (int) bs.size()) {
+                            std::lock_guard<std::mutex> lk(batch_mu);
                             if (b == p_slot) {
                                 stopped = true;
                             } else if (bs[(size_t) b].prefilling) {
@@ -13194,8 +13220,10 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                             }
                         }
                     } else if (in_line.rfind("BSHARE ", 0) == 0) {
-                        session_decode_share = std::max(0.0, std::atof(in_line.c_str() + 7));
+                        session_decode_share.store(std::max(0.0, std::atof(in_line.c_str() + 7)),
+                                                   std::memory_order_release);
                     } else if (in_line.rfind("BPREFILL ", 0) == 0) {
+                        std::lock_guard<std::mutex> lk(batch_mu);
                         (void) start_slot_prefill(in_line);
                     } else {
                         std::lock_guard<std::mutex> lk(in_mu);
@@ -13217,9 +13245,10 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                         return false;
                     }
                 }
-                if (done < to && session_decode_share > 0.0 && batch_on()) {
-                    const double budget = session_decode_share * chunk_ms;
+                if (!overlap_active && done < to && session_decode_share.load(std::memory_order_acquire) > 0.0 && batch_on()) {
+                    const double budget = session_decode_share.load(std::memory_order_acquire) * chunk_ms;
                     const auto td = Clock::now();
+                    std::lock_guard<std::mutex> lk(batch_mu);
                     in_prompt_read = true;
                     do {
                         if (!batch_step()) { in_prompt_read = false; be = "a batch window failed"; return false; }
@@ -13230,16 +13259,60 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                 return true;
             };
 
+            if (overlap_active) {
+                ov_thr = std::thread([&] {
+                    const strata::core::OnDevice on_dev(0);
+                    while (!ov_stop.load(std::memory_order_acquire)) {
+                        const double share = session_decode_share.load(std::memory_order_acquire);
+                        if (share <= 0.0) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                            continue;
+                        }
+                        const auto td0 = Clock::now();
+                        bool ran = false;
+                        bool bok = true;
+                        {
+                            std::lock_guard<std::mutex> lk(batch_mu);
+                            if (batch_on()) {
+                                ran = true;
+                                in_prompt_read = true;
+                                bok = batch_step();
+                                in_prompt_read = false;
+                            }
+                        }
+                        if (!bok) {
+                            ov_err.store(true, std::memory_order_release);
+                            break;
+                        }
+                        if (!ran) break;
+                        const double dt_ms = std::chrono::duration<double, std::milli>(Clock::now() - td0).count();
+                        if (share < 1.0 && dt_ms > 0.0) {
+                            double rem_sleep = std::min(500.0, dt_ms * (1.0 - share) / share);
+                            while (rem_sleep >= 0.5 && !ov_stop.load(std::memory_order_acquire)) {
+                                const double slice = std::min(5.0, rem_sleep);
+                                std::this_thread::sleep_for(std::chrono::microseconds((int64_t) (slice * 1000.0)));
+                                rem_sleep -= slice;
+                            }
+                        }
+                    }
+                });
+            }
+
             std::string rerr;
             const bool ok = sp.run(sl.pf_ids.data() + sl.pf_read_at, to - sl.pf_read_at, sl.pf_read_at, rerr);
+            ov_stop.store(true, std::memory_order_release);
+            if (ov_thr.joinable()) ov_thr.join();
+            if (ov_err.load(std::memory_order_acquire)) return false;
+
             if (!ok) {
                 if (stopped) {
                     cancel_slot_prefill(p_slot, "cancel");
                     return true;
                 }
                 if (preempted) {
-                    // Run one decode slice if batch_on() before switching to the shorter slot.
-                    if (session_decode_share > 0.0 && batch_on()) {
+                    // Run one decode slice if non-overlapped and batch_on() before switching to the shorter slot.
+                    if (!overlap_active && session_decode_share.load(std::memory_order_acquire) > 0.0 && batch_on()) {
+                        std::lock_guard<std::mutex> lk(batch_mu);
                         in_prompt_read = true;
                         const bool bok = batch_step();
                         in_prompt_read = false;
@@ -13268,7 +13341,8 @@ static int qwen4exp_engine_main(int argc, char** argv) {
             if (sl.pf_read_at >= sl.pf_n - 1) {
                 return finish_slot_prefill(p_slot);
             }
-            if (session_decode_share > 0.0 && batch_on()) {
+            if (!overlap_active && session_decode_share.load(std::memory_order_acquire) > 0.0 && batch_on()) {
+                std::lock_guard<std::mutex> lk(batch_mu);
                 in_prompt_read = true;
                 const bool bok = batch_step();
                 in_prompt_read = false;
@@ -13302,7 +13376,7 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                 continue;
             }
             if (line.rfind("BSHARE ", 0) == 0) {
-                session_decode_share = std::max(0.0, std::atof(line.c_str() + 7));
+                session_decode_share.store(std::max(0.0, std::atof(line.c_str() + 7)), std::memory_order_release);
                 continue;
             }
             if (line.rfind("BYIELD", 0) == 0) continue;   // for a prompt read that has ended meanwhile

@@ -196,6 +196,7 @@ public:
     // split's stages each get their own sessions, and run_slot_rows/commit_slots continue into the next stage.
     bool init_slots(const std::vector<SessionState*>& slots, std::string& err);
     int n_slots() const { return (int) slots_.size(); }
+    bool all_resident_active() const { return ar_on(); }
     /// One batch window over the S slots `rows` (row t is slot rows[t], any distinct slots in any order): tokens[t]
     /// at positions pos[t]; out[t] = the greedy pick after it.  The slots not
     /// listed are not touched, so an idle slot keeps its state (a finished conversation it may continue later).

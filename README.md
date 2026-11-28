@@ -1,5 +1,14 @@
 <p align="center"><img src="docs/assets/banner.jpg" alt="Talus: the LLM inference engine for AMD Strix Halo, written in Rust"></p>
 
+# Talus Turbo
+
+Fork of [Talus](https://github.com/nsbradley88/talus-public) (branched from `e5edb0e`) adding native multimodal vision, opt-in XDNA2 NPU prefill offload, overlapped batch scheduling, and stability fixes for AMD Strix Halo (`gfx1151` + `aie2p`).
+
+- **Native Vision ([docs/VISION-TOWER.md](docs/VISION-TOWER.md))**: Multimodal image support on OpenAI (`/v1/chat/completions`, `/v1/responses`) and Anthropic (`/v1/messages`) endpoints via `src/vision/` (`tk_vision`). Set `"vision": {"native": true, ...}` to run the in-engine HIP ViT tower over `@raw` binary frames with shared `VGEOM` geometry across both single-session and `--batch` serving in `talus-server` (or keep `"native": false` for the `strata-vision` subprocess path).
+- **XDNA2 NPU Acceleration ([docs/NPU.md](docs/NPU.md))**: Opt-in (`TALUS_NPU_DIR=./tools/npu`) hybrid GPU+NPU prefill for `Qwen3.8-Flash-Next` (`qwen4exp`) via `dlopen` on `libxrt_coreutil.so.2` (no build-time XRT/AIE dependency) and zero-copy `hipHostMallocMapped` + `AMDXDNA_BO_SHARE` buffers. Includes multi-`M` `mlir-aie` v1.4.5 ATB kernels (`512`/`1024`/`2048`/`4096 x 2560 x 1024`), GPU-tail hybrid dispatch, two-phase activation reuse across GDN `attn_qkv` + `attn_gate` (`z`) with fused `gdn_out_norm_npu_kernel`, QSA `attn_q`, MoE shared experts with fused SwiGLU, per-bucket slice auto-tuning, and an idle-gated keepalive.
+- **Batching & Performance**: Full `talus-server` batch-slot router (`BGEN`/`BGENI`/`BDONE`, prefix-aware slot picking, group economics), zero-copy slot-resident prefill (`BPREFILL`) with SJF preemption, async direct slot state copy and continuous prefill lookahead, concurrent GPU `batch_step()` decode overlapped with prefill on a high-priority HIP verify stream, `--adaptive-decode-share`, solo-to-batch (`parallel_solo`) and mid-read (`BYIELD`) hand-overs, plus solo MTP HIP stream priority on `gfx1151`.
+- **Bug Fixes**: Reserves `CTX_SLACK` (`8` tokens) and validates `max_tokens` before starting SSE streams (preventing mid-stream HTTP 200 failures); fixes `BSlot::draft` wide-copy overflow and `slot_mtp_t` sizing; fixes `BGENI @raw` binary frame parsing; isolates `BPREFILL` from stale `STOP` state; preserves `cache_n`/`prompt_n`/`prompt_ms` across handover legs; and fixes `BYIELD` delivery, queue-jumping, and slot-claim leaks alongside starvation diagnostics.
+
 # Talus
 
 Talus runs large open-weight language models on one AMD Strix Halo machine (Ryzen AI Max+ 395 with the Radeon 8060S,
